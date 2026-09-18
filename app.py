@@ -53,10 +53,9 @@ try:
     # 0=Lunes, 1=Martes, 2=Miércoles, 3=Jueves, 4=Viernes, 5=Sábado, 6=Domingo
     dia_actual = datetime.now().weekday()
     
-    # Si es Jueves(3), Viernes(4), Sábado(5) o Domingo(6): toca el Domingo
     if dia_actual in [3, 4, 5, 6]:
         tipo_sorteo = "Domingo"
-    else:  # Lunes(0), Martes(1), Miércoles(2): toca el Miércoles
+    else:
         tipo_sorteo = "Miércoles"
 
     st.success(f"📅 El sistema detectó automáticamente que el **próximo sorteo** es el de **{tipo_sorteo}**.")
@@ -74,10 +73,23 @@ try:
 
     top_recs = calcular_jugadas_fijas(sorteo_id, tipo_sorteo)
     
+    # Recopilar todos los números de las 3 opciones para contar cuáles se repiten
+    all_recs_numbers = [num for comb, _ in top_recs for num in comb]
+    counts_recs = Counter(all_recs_numbers)
+
     st.subheader(f"Tus 3 Opciones Oficiales (Sorteo N° {sorteo_id + 1})")
+    
     for idx, (comb, freq) in enumerate(top_recs, 1):
-        pares = sum(1 for x in comb if x % 2 == 0)
-        st.info(f"**Opción #{idx} (Fija)**\n* 🔢 Números: `{list(comb)}`\n* ➕ Suma: `{sum(comb)}` | Paridad: `{pares}P / {6-pares}I`")
+        # Formatear cada número: si aparece más de una vez en las 3 opciones, va en negrita (**num**)
+        formatted_nums = []
+        for n in comb:
+            if counts_recs[n] > 1:
+                formatted_nums.append(f"**{n}**")
+            else:
+                formatted_nums.append(str(n))
+        
+        numeros_str = ", ".join(formatted_nums)
+        st.info(f"**Opción #{idx} (Fija):**  `{numeros_str.replace('**', '')}`  \n🔢 Números: {numeros_str}")
 
 except Exception as e:
     st.error(f"Error cargando los datos: {e}")
