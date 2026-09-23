@@ -12,13 +12,20 @@ st.write("Sistema automatizado con rotación exacta post-sorteo.")
 @st.cache_data
 def cargar_datos():
     excel_file = 'La_Tinka_Todos_Los_Sorteos_1994_2026.xlsx'
-    df = pd.read_excel(excel_file, sheet_name='Histórico Completo 1994-2026', skiprows=2)
-    df.columns = df.iloc[0]
-    df = df[1:].reset_index(drop=True)
+    # Leemos directamente desde la primera fila (header=0) tras los cambios en el Excel
+    df = pd.read_excel(excel_file, sheet_name='Histórico Completo 1994-2026', header=0)
+    
+    # Limpiamos espacios en blanco en los nombres de las columnas por seguridad
+    df.columns = df.columns.astype(str).str.strip()
+    
     bolilla_cols = ['Bolilla 1', 'Bolilla 2', 'Bolilla 3', 'Bolilla 4', 'Bolilla 5', 'Bolilla 6']
     for col in bolilla_cols:
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-    df['Fecha_dt'] = pd.to_datetime(df['Fecha'], format='%d/%m/%Y', errors='coerce')
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+            
+    if 'Fecha' in df.columns:
+        df['Fecha_dt'] = pd.to_datetime(df['Fecha'], format='%d/%m/%Y', errors='coerce')
+        
     return df.sort_values('Fecha_dt').reset_index(drop=True)
 
 try:
