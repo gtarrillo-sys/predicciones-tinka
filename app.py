@@ -1,4 +1,15 @@
 # ==============================================================
+# LA TINKA AI - VERSION CORREGIDA Y EJECUTABLE
+# ==============================================================
+# IMPORTANTE:
+# Este archivo es Python puro. NO contiene ```python ni ``` al inicio
+# o al final. Puede ejecutarse directamente con:
+#
+#     streamlit run app.py
+#
+# ==============================================================
+
+# ==============================================================
 # LA TINKA AI - SISTEMA DE ANÁLISIS HISTÓRICO Y GENERACIÓN
 # ==============================================================
 #
@@ -36,7 +47,6 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 
-from scipy.stats import zscore
 
 
 # ==============================================================
@@ -661,9 +671,23 @@ def calculate_pair_frequency(df):
 # PROBABILIDAD EMPÍRICA DE ESTRUCTURA
 # ==============================================================
 
+def get_low_threshold(df):
+    """
+    Define dinámicamente el punto medio del universo observado.
+    Esto evita asumir que La Tinka siempre utilizó 48 bolillas.
+    """
+    universe = get_ball_universe(df)
+
+    if not universe:
+        return 24
+
+    return (min(universe) + max(universe)) / 2.0
+
+
 def calculate_structure_distribution(df):
 
     structures = []
+    low_threshold = get_low_threshold(df)
 
     for _, row in df.iterrows():
 
@@ -687,7 +711,7 @@ def calculate_structure_distribution(df):
         )
 
         low = sum(
-            n <= 24
+            n <= low_threshold
             for n in numbers
         )
 
@@ -747,7 +771,8 @@ def structure_statistics(df):
 
 def structure_score(
     combination,
-    structure_stats
+    structure_stats,
+    low_threshold=24
 ):
 
     if not structure_stats:
@@ -772,7 +797,7 @@ def structure_score(
     )
 
     low = sum(
-        n <= 24
+        n <= low_threshold
         for n in numbers
     )
 
@@ -863,6 +888,7 @@ def combination_score(
     pair_frequency,
     structure_stats,
     total_draws,
+    low_threshold=24,
     w_ball=0.60,
     w_pair=0.25,
     w_structure=0.15,
@@ -906,7 +932,8 @@ def combination_score(
 
     structure = structure_score(
         combination,
-        structure_stats
+        structure_stats,
+        low_threshold=low_threshold
     )
 
     # ----------------------------------------------------------
@@ -1073,6 +1100,8 @@ def generate_candidates(
         df
     )
 
+    low_threshold = get_low_threshold(df)
+
     historical_combinations = set(
         tuple(
             sorted(
@@ -1127,6 +1156,7 @@ def generate_candidates(
             pair_frequency,
             structure_stats,
             len(df),
+            low_threshold=low_threshold,
             w_ball=w_ball,
             w_pair=w_pair,
             w_structure=w_structure,
@@ -1257,7 +1287,7 @@ def backtest_strategy(
             min_sum=90,
             max_sum=195,
             max_consecutive=1,
-            exclude_historical=True,
+            exclude_historical=False,
         )
 
         top = select_top_combinations(
