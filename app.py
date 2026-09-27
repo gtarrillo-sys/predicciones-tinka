@@ -39,6 +39,8 @@ from __future__ import annotations
 import os
 import hashlib
 from pathlib import Path
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from collections import Counter
 from itertools import combinations
 from typing import Dict, List, Tuple, Optional
@@ -59,6 +61,31 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+# ==============================================================
+# PROGRAMACIÓN AUTOMÁTICA DEL PRÓXIMO SORTEO
+# ==============================================================
+
+DIAS_SORTEO = {
+    2: "miércoles",
+    6: "domingo",
+}
+
+
+def proximo_sorteo():
+    """Devuelve el próximo sorteo programado en hora de Perú.
+
+    Si hoy es miércoles o domingo, considera el sorteo de hoy.
+    En cualquier otro día, avanza hasta el siguiente miércoles/domingo.
+    """
+    ahora = datetime.now(ZoneInfo("America/Lima"))
+    fecha = ahora.date()
+
+    while fecha.weekday() not in DIAS_SORTEO:
+        fecha += timedelta(days=1)
+
+    return fecha, DIAS_SORTEO[fecha.weekday()]
 
 
 # ==============================================================
@@ -1855,11 +1882,15 @@ def main():
                 step=500,
             )
 
-            top_n = st.number_input(
-                "Combinaciones finales",
-                min_value=1,
-                max_value=50,
-                value=10,
+            # Se muestran exactamente 3 combinaciones finales.
+            top_n = 3
+
+            fecha_sorteo, dia_sorteo = proximo_sorteo()
+
+            st.info(
+                f"🎯 Sorteo objetivo: **{dia_sorteo.capitalize()} "
+                f"{fecha_sorteo.strftime('%d/%m/%Y')}**\n\n"
+                "El sistema genera automáticamente 3 combinaciones."
             )
 
             min_sum = st.number_input(
@@ -1914,6 +1945,9 @@ def main():
 
         else:
 
+            # La fecha del sorteo objetivo forma parte de la semilla.
+            # De esta manera, miércoles y domingo pueden generar una
+            # tanda diferente aun cuando el histórico todavía no cambie.
             seed = stable_seed(
                 len(df),
                 str(
@@ -1921,7 +1955,9 @@ def main():
                 ),
                 int(
                     df["Sorteo"].fillna(0).iloc[-1]
-                )
+                ),
+                str(fecha_sorteo),
+                dia_sorteo,
             )
 
         if st.button(
@@ -1950,7 +1986,7 @@ def main():
 
                 final = select_top_combinations(
                     candidates,
-                    top_n=int(top_n),
+                    top_n=top_n,
                     diversity=diversity,
                 )
 
@@ -1970,10 +2006,8 @@ def main():
                 )
 
                 st.success(
-                    f"""
-                    Se generaron {len(final)}
-                    combinaciones.
-                    """
+                    f"Se generaron {len(final)} combinaciones para el "
+                    f"sorteo del {dia_sorteo} ({fecha_sorteo.strftime('%d/%m/%Y')})."
                 )
 
                 st.dataframe(
