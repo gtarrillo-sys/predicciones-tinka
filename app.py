@@ -1129,44 +1129,36 @@ def backtest_strategy(
     strategy: str = "Modelo",
     exclude_historical: bool = False,
     use_reventon_feature: bool = False,
+    progress_callback=None,
+    progress_offset: int = 0,
+    progress_total: int = 1,
 ) -> pd.DataFrame:
+    """Backtesting walk-forward. progress_callback(done,total,strategy)."""
     data = df.sort_values(["Fecha", "Sorteo"]).reset_index(drop=True)
-
+    step = max(1, int(step))
+    min_train = max(1, int(min_train))
+    test_indices = list(range(min_train, len(data), step))
     records = []
 
-    for test_index in range(min_train, len(data), max(1, step)):
-        train = data.iloc[:test_index].copy()
+    for local_idx, test_index in enumerate(test_indices, 1):
+        train = data.iloc[:test_index]
         actual_row = data.iloc[test_index]
-
         actual = tuple(int(actual_row[c]) for c in BALL_COLUMNS)
 
-        # Universo correcto para el momento del sorteo objetivo.
-        universe_size = universe_for_date(
-            actual_row["Fecha"], schedule
-        )
+        universe_size = universe_for_date(actual_row["Fecha"], schedule)
         universe = list(range(1, universe_size + 1))
 
-        # Reventón: solo variables de filas anteriores.
-        # No se utiliza ReventoVerde de actual_row.
         if use_reventon_feature:
-            # Se incluye como contexto únicamente si existe información
-            # suficiente ANTES del sorteo objetivo.
             prev_revent_raw = train.iloc[-1]["ReventoVerde"]
             streak_raw = train.iloc[-1]["SorteosSinReventarAntes"]
-
             prev_revent_value = safe_bool(prev_revent_raw)
             if prev_revent_value is None or pd.isna(streak_raw):
-                # Información incompleta: no inventamos el contexto.
                 prev_revent = "desconocido"
                 streak = "desconocido"
             else:
-                prev_revent = bool(prev_revent_raw)
+                prev_revent = bool(prev_revent_value)
                 streak = int(float(streak_raw)) + (0 if prev_revent else 1)
-
-            seed_context = (
-                f"{strategy}|{actual_row['Fecha'].date()}|"
-                f"{prev_revent}|{streak}"
-            )
+            seed_context = f"{strategy}|{actual_row['Fecha'].date()}|{prev_revent}|{streak}"
         else:
             seed_context = f"{strategy}|{actual_row['Fecha'].date()}"
 
@@ -1175,22 +1167,14 @@ def backtest_strategy(
         if strategy == "Aleatorio":
             rng = np.random.default_rng(seed)
             tickets = random_combinations(
-                universe,
-                top_n,
-                rng,
-                min_sum=min_sum,
-                max_sum=max_sum,
+                universe, top_n, rng,
+                min_sum=min_sum, max_sum=max_sum,
                 max_consecutive=max_consecutive,
             )
-
         else:
-            candidates, info = generate_candidates(
-                train=train,
-                universe=universe,
-                n_candidates=n_candidates,
-                seed=seed,
-                min_sum=min_sum,
-                max_sum=max_sum,
+            candidates, _ = generate_candidates(
+                train=train, universe=universe, n_candidates=n_candidates,
+                seed=seed, min_sum=min_sum, max_sum=max_sum,
                 max_consecutive=max_consecutive,
                 exclude_historical=exclude_historical,
                 use_reventon_context=use_reventon_feature,
@@ -1202,17 +1186,13 @@ def backtest_strategy(
             )
 
             if strategy == "Frecuencia":
-                # Generación basada solamente en frecuencia histórica.
-                # Reordena candidatos con score de frecuencia.
                 scores = calculate_ball_scores(train, universe, 1.0, 0.0)
                 if not candidates.empty:
                     candidates = candidates.copy()
                     candidates["StrategyScore"] = candidates["Combinación"].apply(
                         lambda c: float(np.mean([scores[n] for n in c]))
                     )
-                    candidates = candidates.sort_values(
-                        "StrategyScore", ascending=False
-                    )
+                    candidates = candidates.sort_values("StrategyScore", ascending=False)
             elif strategy == "Frecuencia + Recencia":
                 scores = calculate_ball_scores(train, universe, 0.65, 0.35)
                 if not candidates.empty:
@@ -1220,31 +1200,24 @@ def backtest_strategy(
                     candidates["StrategyScore"] = candidates["Combinación"].apply(
                         lambda c: float(np.mean([scores[n] for n in c]))
                     )
-                    candidates = candidates.sort_values(
-                        "StrategyScore", ascending=False
-                    )
+                    candidates = candidates.sort_values("StrategyScore", ascending=False)
 
-            selected = select_top_combinations(
-                candidates, top_n=top_n, diversity=True
-            )
-            tickets = [
-                tuple(x) for x in selected["Combinación"].tolist()
-            ] if not selected.empty else []
+            selected = select_top_combinations(candidates, top_n=top_n, diversity=True)
+            tickets = [tuple(x) for x in selected["Combinación"].tolist()] if not selected.empty else []
 
         metrics = evaluate_ticket_set(tickets, actual)
+        records.append({
+            "Fecha": actual_row["Fecha"],
+            "Sorteo": actual_row["Sorteo"],
+            "Estrategia": strategy,
+            "Tickets": len(tickets),
+            **metrics,
+        })
 
-        records.append(
-            {
-                "Fecha": actual_row["Fecha"],
-                "Sorteo": actual_row["Sorteo"],
-                "Estrategia": strategy,
-                "Tickets": len(tickets),
-                **metrics,
-            }
-        )
+        if progress_callback is not None:
+            progress_callback(progress_offset + local_idx, progress_total, strategy)
 
     return pd.DataFrame(records)
-
 
 def summarize_backtest(results: pd.DataFrame) -> pd.DataFrame:
     if results.empty:
@@ -1713,142 +1686,108 @@ def main():
 
     elif menu == "Backtesting":
         st.header("🧪 Backtesting")
-
         st.write(
-            "El sistema toma cada sorteo histórico como si fuera futuro: "
-            "entrena únicamente con sorteos anteriores y luego compara "
-            "las combinaciones generadas con el resultado real."
+            "El sistema entrena solo con sorteos anteriores y compara las "
+            "combinaciones obtenidas con el sorteo histórico siguiente."
         )
+
+        mode = st.radio(
+            "Modo de ejecución",
+            ["⚡ Rápido", "🔬 Completo"],
+            horizontal=True,
+            help=(
+                "Rápido reduce el número de evaluaciones para comprobar el modelo. "
+                "Completo evalúa muchos más sorteos y tarda considerablemente más."
+            ),
+        )
+
+        if mode == "⚡ Rápido":
+            default_step, default_candidates = 10, 300
+            st.info("Modo rápido: una prueba cada 10 sorteos y 300 candidatos por prueba.")
+        else:
+            default_step, default_candidates = 1, 1000
+            st.warning("Modo completo: una prueba por sorteo. Puede tardar varios minutos.")
 
         c1, c2, c3, c4 = st.columns(4)
-
-        min_train = c1.number_input(
-            "Sorteos mínimos de entrenamiento",
-            50,
-            2000,
-            200,
-            10,
-        )
-
-        step = c2.number_input(
-            "Paso entre pruebas",
-            1,
-            50,
-            1,
-            1,
-            help="1 prueba cada sorteo. Un valor mayor acelera, pero evalúa menos sorteos.",
-        )
-
-        top_n_bt = c3.number_input(
-            "Tickets por prueba",
-            1,
-            50,
-            10,
-            1,
-        )
-
-        n_candidates_bt = c4.number_input(
-            "Candidatos por prueba",
-            200,
-            10000,
-            1500,
-            100,
-        )
+        min_train = c1.number_input("Sorteos mínimos de entrenamiento", 50, 2000, 200, 10)
+        step = c2.number_input("Paso entre pruebas", 1, 100, default_step, 1)
+        top_n_bt = c3.number_input("Tickets por prueba", 1, 50, 10, 1)
+        n_candidates_bt = c4.number_input("Candidatos por prueba", 100, 10000, default_candidates, 100)
 
         st.subheader("Restricciones de la prueba")
-
         c1, c2, c3 = st.columns(3)
-
         use_sum_bt = c1.checkbox("Usar rango de suma", value=False)
         use_cons_bt = c2.checkbox("Usar límite consecutivos", value=False)
-        exclude_hist_bt = c3.checkbox(
-            "Excluir combinaciones históricas",
-            value=False,
-        )
+        exclude_hist_bt = c3.checkbox("Excluir combinaciones históricas", value=False)
 
         min_sum_bt = max_sum_bt = max_cons_bt = None
-
         if use_sum_bt:
             c1, c2 = st.columns(2)
             min_sum_bt = c1.number_input("Suma mínima BT", 0, 600, 90)
             max_sum_bt = c2.number_input("Suma máxima BT", 0, 600, 195)
-
         if use_cons_bt:
-            max_cons_bt = st.number_input(
-                "Máximo consecutivos BT",
-                0,
-                5,
-                1,
-            )
+            max_cons_bt = st.number_input("Máximo consecutivos BT", 0, 5, 1)
 
         use_reventon = st.checkbox(
-            "Registrar contexto de reventón anterior",
+            "Usar contexto de reventón anterior",
             value=True,
-            help=(
-                "Solo usa información de sorteos anteriores al objetivo. "
-                "No utiliza el reventón del sorteo que se está evaluando."
-            ),
+            help="Solo usa información conocida antes del sorteo objetivo. Los datos desconocidos no se convierten en 'no reventó'.",
         )
 
         if st.button("▶️ Ejecutar backtesting", type="primary"):
-            strategies = [
-                "Aleatorio",
-                "Modelo",
-                "Frecuencia",
-                "Frecuencia + Recencia",
-            ]
-
+            strategies = ["Aleatorio", "Modelo", "Frecuencia", "Frecuencia + Recencia"]
+            test_count = len(range(int(min_train), len(df), max(1, int(step))))
+            total_work = max(1, test_count * len(strategies))
+            progress = st.progress(0.0)
+            status = st.empty()
             all_results = []
 
-            progress = st.progress(0)
+            def update_progress(done, total, strategy_name):
+                fraction = min(1.0, done / max(1, total))
+                progress.progress(fraction)
+                status.info(
+                    f"Procesando **{strategy_name}** · {done:,}/{total:,} "
+                    f"evaluaciones ({fraction:.1%})"
+                )
 
             for idx, strategy in enumerate(strategies):
                 result = backtest_strategy(
-                    df=df,
-                    schedule=schedule,
-                    min_train=int(min_train),
-                    step=int(step),
-                    top_n=int(top_n_bt),
-                    n_candidates=int(n_candidates_bt),
-                    min_sum=min_sum_bt,
-                    max_sum=max_sum_bt,
-                    max_consecutive=max_cons_bt,
-                    strategy=strategy,
-                    exclude_historical=exclude_hist_bt,
+                    df=df, schedule=schedule, min_train=int(min_train),
+                    step=int(step), top_n=int(top_n_bt),
+                    n_candidates=int(n_candidates_bt), min_sum=min_sum_bt,
+                    max_sum=max_sum_bt, max_consecutive=max_cons_bt,
+                    strategy=strategy, exclude_historical=exclude_hist_bt,
                     use_reventon_feature=use_reventon,
+                    progress_callback=update_progress,
+                    progress_offset=idx * test_count,
+                    progress_total=total_work,
                 )
                 all_results.append(result)
-                progress.progress((idx + 1) / len(strategies))
 
-            results = pd.concat(all_results, ignore_index=True)
-            summary = summarize_backtest(results)
+            progress.progress(1.0)
+            status.success(f"Backtesting terminado: {total_work:,} evaluaciones.")
 
-            st.subheader("Resumen")
-            st.dataframe(
-                summary,
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            st.subheader("Resultados por sorteo")
-            st.dataframe(
-                results.sort_values(["Fecha", "Estrategia"]),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-            st.download_button(
-                "⬇️ Descargar resultados del backtesting",
-                results.to_csv(index=False).encode("utf-8-sig"),
-                file_name="backtesting_la_tinka.csv",
-                mime="text/csv",
-            )
-
-            st.info(
-                "Las métricas son descriptivas. La comparación no demuestra "
-                "que una estrategia tenga mayor probabilidad futura; sirve "
-                "para comprobar cómo se comportó históricamente."
-            )
+            results = pd.concat(all_results, ignore_index=True) if all_results else pd.DataFrame()
+            if results.empty:
+                st.warning("No hay suficientes datos para ejecutar el backtesting con estos parámetros.")
+            else:
+                summary = summarize_backtest(results)
+                st.subheader("Resumen")
+                st.dataframe(summary, use_container_width=True, hide_index=True)
+                st.subheader("Resultados por sorteo")
+                st.dataframe(
+                    results.sort_values(["Fecha", "Estrategia"]),
+                    use_container_width=True, hide_index=True,
+                )
+                st.download_button(
+                    "⬇️ Descargar resultados del backtesting",
+                    results.to_csv(index=False).encode("utf-8-sig"),
+                    file_name="backtesting_la_tinka.csv", mime="text/csv",
+                )
+                st.info(
+                    "Las métricas son descriptivas: muestran cómo se comportaron "
+                    "las estrategias en datos históricos y no garantizan resultados futuros."
+                )
 
     # ==========================================================
     # REVENTONES
