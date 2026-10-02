@@ -54,7 +54,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.2 - backtesting robusto con datos de premios incompletos"
+APP_VERSION = "3.3 - backtesting robusto con pd.NA/NaN y premios incompletos"
 
 DEFAULT_FILES = [
     "La_Tinka_Todos_Los_Sorteos_1994_2026.xlsx",
@@ -543,6 +543,18 @@ def valid_numbers_for_training(
     # El universo oficial es 1..n. No usamos solo números observados:
     # un número válido puede no haber aparecido todavía.
     return list(range(1, n + 1))
+
+
+def safe_bool(value):
+    """Convierte valores a bool sin fallar con NaN o pd.NA."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    return bool(value)
 
 
 def prize_coverage(df: pd.DataFrame) -> Dict:
@@ -1138,9 +1150,9 @@ def backtest_strategy(
             prev_revent_raw = train.iloc[-1]["ReventoVerde"]
             streak_raw = train.iloc[-1]["SorteosSinReventarAntes"]
 
-            if pd.isna(prev_revent_raw) or pd.isna(streak_raw):
-                # Información de premios/reventones desconocida:
-                # no inventamos un valor y no dejamos que el backtesting falle.
+            prev_revent_value = safe_bool(prev_revent_raw)
+            if prev_revent_value is None or pd.isna(streak_raw):
+                # Información incompleta: no inventamos el contexto.
                 prev_revent = "desconocido"
                 streak = "desconocido"
             else:
@@ -1179,7 +1191,7 @@ def backtest_strategy(
                 exclude_historical=exclude_historical,
                 use_reventon_context=use_reventon_feature,
                 current_reventon_context=(
-                    bool(train.iloc[-1]["ReventoVerde"])
+                    safe_bool(train.iloc[-1]["ReventoVerde"])
                     if use_reventon_feature and "ReventoVerde" in train.columns
                     else False
                 ),
@@ -1642,7 +1654,7 @@ def main():
                 exclude_historical=exclude_hist,
                 use_reventon_context=use_reventon_gen,
                 current_reventon_context=(
-                    bool(df.iloc[-1]["ReventoVerde"])
+                    safe_bool(df.iloc[-1]["ReventoVerde"])
                     if use_reventon_gen
                     else False
                 ),
