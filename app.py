@@ -54,7 +54,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.0 - premios parciales + reventones + universo histórico + backtesting"
+APP_VERSION = "3.2 - backtesting robusto con datos de premios incompletos"
 
 DEFAULT_FILES = [
     "La_Tinka_Todos_Los_Sorteos_1994_2026.xlsx",
@@ -377,8 +377,12 @@ def attach_prize_features(
         out = out.merge(green_map, on="Sorteo", how="left", suffixes=("", "_green"))
 
         if "ReventoVerde_green" in out.columns:
+            # Caso en que la tabla base ya traía una columna con ese nombre.
             out["ReventoVerde"] = out["ReventoVerde_green"].astype("boolean")
             out = out.drop(columns=["ReventoVerde_green"], errors="ignore")
+        elif "ReventoVerde" in out.columns:
+            # Caso normal: la columna proviene directamente de green_map.
+            out["ReventoVerde"] = out["ReventoVerde"].astype("boolean")
         else:
             out["ReventoVerde"] = pd.Series(
                 pd.NA, index=out.index, dtype="boolean"
@@ -416,6 +420,8 @@ def attach_prize_features(
         streak.append(float(n) if known else np.nan)
 
         if pd.isna(value):
+            # No sabemos si hubo o no reventón en este período.
+            # No continuamos acumulando una racha inventada.
             known = False
         elif bool(value):
             n = 0
@@ -693,8 +699,10 @@ def calculate_contextual_ball_scores(
     if "ReventoAnterior" not in df.columns:
         return base
 
+    known_context = df["ReventoAnterior"].notna()
     contextual = df[
-        df["ReventoAnterior"].astype(bool) == bool(current_reventon_context)
+        known_context
+        & (df["ReventoAnterior"].astype(bool) == bool(current_reventon_context))
     ].copy()
 
     # Evitar que una muestra contextual demasiado pequeña domine el modelo.
@@ -1125,13 +1133,24 @@ def backtest_strategy(
         # Reventón: solo variables de filas anteriores.
         # No se utiliza ReventoVerde de actual_row.
         if use_reventon_feature:
-            # Se incluye como ajuste de contexto en la semilla/modelo,
-            # pero nunca se usa el estado del objetivo.
-            prev_revent = (pd.notna(train.iloc[-1]["ReventoVerde"]) and bool(train.iloc[-1]["ReventoVerde"]))
-            streak = int(train.iloc[-1]["SorteosSinReventarAntes"]) + (
-                0 if prev_revent else 1
+            # Se incluye como contexto únicamente si existe información
+            # suficiente ANTES del sorteo objetivo.
+            prev_revent_raw = train.iloc[-1]["ReventoVerde"]
+            streak_raw = train.iloc[-1]["SorteosSinReventarAntes"]
+
+            if pd.isna(prev_revent_raw) or pd.isna(streak_raw):
+                # Información de premios/reventones desconocida:
+                # no inventamos un valor y no dejamos que el backtesting falle.
+                prev_revent = "desconocido"
+                streak = "desconocido"
+            else:
+                prev_revent = bool(prev_revent_raw)
+                streak = int(float(streak_raw)) + (0 if prev_revent else 1)
+
+            seed_context = (
+                f"{strategy}|{actual_row['Fecha'].date()}|"
+                f"{prev_revent}|{streak}"
             )
-            seed_context = f"{strategy}|{actual_row['Fecha'].date()}|{prev_revent}|{streak}"
         else:
             seed_context = f"{strategy}|{actual_row['Fecha'].date()}"
 
@@ -1322,7 +1341,14 @@ def main():
         file_bytes = uploaded.getvalue()
         file_sig = hashlib.sha256(file_bytes).hexdigest()
         source_name = uploaded.name
-        sheets = read_excel_fresh(uploaded)
+        try:
+            sheets = read_excel_fresh(uploaded)
+        except Exception as exc:
+            st.error(
+                "No se pudo leer el Excel. "
+                f"Detalle técnico: {type(exc).__name__}: {exc}"
+            )
+            st.stop()
     else:
         default_path = find_file()
 
@@ -1335,7 +1361,14 @@ def main():
         file_bytes = default_path.read_bytes()
         file_sig = file_signature(default_path)
         source_name = default_path.name
-        sheets = read_excel_fresh(default_path)
+        try:
+            sheets = read_excel_fresh(default_path)
+        except Exception as exc:
+            st.error(
+                "No se pudo leer el Excel predeterminado. "
+                f"Detalle técnico: {type(exc).__name__}: {exc}"
+            )
+            st.stop()
 
     if "Resultados" not in sheets:
         st.error(
