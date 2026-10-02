@@ -711,11 +711,15 @@ def calculate_contextual_ball_scores(
     if "ReventoAnterior" not in df.columns:
         return base
 
-    known_context = df["ReventoAnterior"].notna()
-    contextual = df[
-        known_context
-        & (df["ReventoAnterior"].astype(bool) == bool(current_reventon_context))
-    ].copy()
+    # ReventoAnterior puede contener pd.NA/NaN porque el reventón histórico
+    # no está documentado para todos los sorteos. No convertir toda la serie
+    # a bool: astype(bool) falla cuando existen valores faltantes.
+    context_value = safe_bool(current_reventon_context)
+    if context_value is None:
+        return base
+
+    contextual_mask = df["ReventoAnterior"].eq(context_value).fillna(False)
+    contextual = df.loc[contextual_mask].copy()
 
     # Evitar que una muestra contextual demasiado pequeña domine el modelo.
     if len(contextual) < 20:
