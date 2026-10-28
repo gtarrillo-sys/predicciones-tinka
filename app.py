@@ -1,40 +1,34 @@
+
 # ==============================================================
-# LA TINKA AI - VERSION ACTUALIZADA
+# LA TINKA AI - VERSION 4.0
+# Análisis histórico, generación y backtesting
 # ==============================================================
-# Reemplaza la versión anterior de app.py.
-#
-# Mejoras principales:
-# 1) Recarga real del Excel subido (sin caché obsoleto).
-# 2) Detecta automáticamente el último sorteo.
-# 3) Muestra alerta si el archivo está desactualizado.
-# 4) Detecta los premios "reventados" mediante resaltado verde
-#    en la columna Premio y permite usar esa información como
-#    variable histórica disponible antes del siguiente sorteo.
-# 5) Usa la hoja Modificaciones para determinar el universo
-#    histórico de bolillas por fecha.
-# 6) Backtesting walk-forward configurable.
-# 7) Comparación contra una referencia aleatoria bajo las
-#    mismas restricciones.
-# 8) No utiliza el monto/reventón del sorteo objetivo para
-#    predecir ese mismo sorteo (evita look-ahead).
-#
-# INSTALACIÓN:
+# Instalación:
 # pip install streamlit pandas numpy openpyxl
 #
-# EJECUCIÓN:
+# Ejecución:
 # streamlit run app.py
+#
+# Archivo esperado:
+# Resultados la Tinka 1994 a 2026.xlsx
+#
+# Hojas:
+#   Resultados
+#   Modificaciones
+#
+# Las seis bolillas principales son el objetivo de evaluación.
+# El sistema es experimental: no garantiza aciertos futuros.
 # ==============================================================
 
 from __future__ import annotations
 
 import hashlib
 import io
-import os
 from collections import Counter
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 from itertools import combinations
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -54,13 +48,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-APP_VERSION = "3.3 - backtesting robusto con pd.NA/NaN y premios incompletos"
-
-DEFAULT_FILES = [
-    "La_Tinka_Todos_Los_Sorteos_1994_2026.xlsx",
-    "Resultados la Tinka 1994 a 2026.xlsx",
-    "Resultados_la_Tinka_1994_2026_revisado.xlsx",
-]
+APP_VERSION = "4.0 - estrategias independientes y backtesting corregido"
 
 BALL_COLUMNS = [
     "Bolilla 1",
@@ -71,65 +59,51 @@ BALL_COLUMNS = [
     "Bolilla 6",
 ]
 
-DATE_CANDIDATES = ["Fecha", "fecha", "FECHA"]
-DRAW_CANDIDATES = ["Sorteo", "sorteo", "SORTEO"]
+DEFAULT_FILES = [
+    "Resultados la Tinka 1994 a 2026.xlsx",
+    "Resultados_la_Tinka_1994_2026_revisado.xlsx",
+    "La_Tinka_Todos_Los_Sorteos_1994_2026.xlsx",
+]
+
+STRATEGIES = [
+    "Aleatorio",
+    "Modelo",
+    "Frecuencia",
+    "Frecuencia + Recencia",
+]
 
 
 # ==============================================================
-# PROGRAMACIÓN
+# UTILIDADES GENERALES
 # ==============================================================
 
-DIAS_SORTEO = {2: "miércoles", 6: "domingo"}
-
-
-def proximo_sorteo():
-    ahora = datetime.now(ZoneInfo("America/Lima"))
-    fecha = ahora.date()
-
-    while fecha.weekday() not in DIAS_SORTEO:
-        fecha += timedelta(days=1)
-
-    return fecha, DIAS_SORTEO[fecha.weekday()]
-
-
-# ==============================================================
-# UTILIDADES
-# ==============================================================
-
-def normalize_text(text) -> str:
-    if text is None:
+def normalize_text(value) -> str:
+    if value is None:
         return ""
-    return (
-        str(text)
-        .strip()
-        .lower()
-        .replace("á", "a")
-        .replace("é", "e")
-        .replace("í", "i")
-        .replace("ó", "o")
-        .replace("ú", "u")
-        .replace("ñ", "n")
-        .replace("_", " ")
-    )
+
+    replacements = str(value).strip().lower()
+    for old, new in [
+        ("á", "a"),
+        ("é", "e"),
+        ("í", "i"),
+        ("ó", "o"),
+        ("ú", "u"),
+        ("ñ", "n"),
+        ("_", " "),
+    ]:
+        replacements = replacements.replace(old, new)
+
+    return replacements
 
 
 def normalize_ball_column(name) -> str:
-    s = normalize_text(name).replace(" ", "")
-    replacements = {
-        "bolilla1": "Bolilla 1",
-        "bolilla2": "Bolilla 2",
-        "bolilla3": "Bolilla 3",
-        "bolilla4": "Bolilla 4",
-        "bolilla5": "Bolilla 5",
-        "bolilla6": "Bolilla 6",
-        "bolilla01": "Bolilla 1",
-        "bolilla02": "Bolilla 2",
-        "bolilla03": "Bolilla 3",
-        "bolilla04": "Bolilla 4",
-        "bolilla05": "Bolilla 5",
-        "bolilla06": "Bolilla 6",
-    }
-    return replacements.get(s, str(name).strip())
+    compact = normalize_text(name).replace(" ", "")
+
+    for i in range(1, 7):
+        if compact in (f"bolilla{i}", f"bolilla0{i}"):
+            return f"Bolilla {i}"
+
+    return str(name).strip()
 
 
 def stable_seed(*values) -> int:
@@ -137,102 +111,109 @@ def stable_seed(*values) -> int:
     return int(hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8], 16)
 
 
+def safe_bool(value):
+    if value is None:
+        return None
+
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+
+    return bool(value)
+
+
 def find_file() -> Optional[Path]:
-    possible = []
     for filename in DEFAULT_FILES:
-        possible += [
+        candidates = [
             Path(filename),
             Path("datos") / filename,
             Path("/mnt/data") / filename,
         ]
-    for path in possible:
-        if path.exists():
-            return path
+
+        for path in candidates:
+            if path.exists():
+                return path
+
     return None
 
 
-def file_signature(file_obj_or_path) -> str:
-    """Firma del contenido: evita que Streamlit reutilice un Excel viejo."""
-    if isinstance(file_obj_or_path, (str, Path)):
-        p = Path(file_obj_or_path)
-        stat = p.stat()
-        return f"{p.resolve()}|{stat.st_size}|{stat.st_mtime_ns}"
+def get_file_bytes(source) -> bytes:
+    if isinstance(source, (str, Path)):
+        return Path(source).read_bytes()
 
-    data = file_obj_or_path.getvalue()
-    return hashlib.sha256(data).hexdigest()
+    return source.getvalue()
 
-
-# ==============================================================
-# CARGA DEL EXCEL
-# ==============================================================
 
 @st.cache_data(show_spinner=False)
-def load_excel_cached(file_bytes: bytes, signature: str) -> Dict[str, pd.DataFrame]:
-    """Lee el contenido del Excel. La firma obliga a recalcular cuando cambia."""
-    xls = pd.ExcelFile(io.BytesIO(file_bytes))
+def load_excel_cached(file_bytes: bytes):
+    excel = pd.ExcelFile(io.BytesIO(file_bytes))
+
     return {
-        sheet: pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet)
-        for sheet in xls.sheet_names
+        sheet: pd.read_excel(
+            io.BytesIO(file_bytes),
+            sheet_name=sheet,
+        )
+        for sheet in excel.sheet_names
     }
 
 
-def read_excel_fresh(source) -> Dict[str, pd.DataFrame]:
-    """Entrada única para archivos locales o UploadedFile."""
-    if isinstance(source, (str, Path)):
-        p = Path(source)
-        data = p.read_bytes()
-        sig = file_signature(p)
-    else:
-        data = source.getvalue()
-        sig = hashlib.sha256(data).hexdigest()
-
-    return load_excel_cached(data, sig)
+def read_excel_fresh(source):
+    return load_excel_cached(get_file_bytes(source))
 
 
 # ==============================================================
-# DETECCIÓN Y PREPARACIÓN
+# PREPARACIÓN DE RESULTADOS
 # ==============================================================
 
-def detect_date_column(df: pd.DataFrame):
-    normalized = {normalize_text(c): c for c in df.columns}
-    for candidate in DATE_CANDIDATES:
-        if normalize_text(candidate) in normalized:
-            return normalized[normalize_text(candidate)]
-    for c in df.columns:
-        if "fecha" in normalize_text(c):
-            return c
+def detect_date_column(df):
+    for column in df.columns:
+        if normalize_text(column) == "fecha":
+            return column
+
+    for column in df.columns:
+        if "fecha" in normalize_text(column):
+            return column
+
     return None
 
 
-def detect_draw_column(df: pd.DataFrame):
-    normalized = {normalize_text(c): c for c in df.columns}
-    for candidate in DRAW_CANDIDATES:
-        if normalize_text(candidate) in normalized:
-            return normalized[normalize_text(candidate)]
-    for c in df.columns:
-        if "sorteo" in normalize_text(c) and "extra" not in normalize_text(c):
-            return c
+def detect_draw_column(df):
+    for column in df.columns:
+        if normalize_text(column) == "sorteo":
+            return column
+
+    for column in df.columns:
+        name = normalize_text(column)
+        if "sorteo" in name and "extra" not in name:
+            return column
+
     return None
 
 
-def detect_ball_columns(df: pd.DataFrame) -> List[str]:
+def detect_ball_columns(df):
     found = {}
-    for c in df.columns:
-        nc = normalize_ball_column(c)
-        if nc in BALL_COLUMNS:
-            found[nc] = c
 
-    missing = [c for c in BALL_COLUMNS if c not in found]
+    for column in df.columns:
+        normalized = normalize_ball_column(column)
+
+        if normalized in BALL_COLUMNS:
+            found[normalized] = column
+
+    missing = [column for column in BALL_COLUMNS if column not in found]
+
     if missing:
         raise ValueError(
-            "No se encontraron las seis columnas de bolillas. "
+            "No se encontraron las seis bolillas principales. "
             f"Faltan: {', '.join(missing)}"
         )
-    return [found[c] for c in BALL_COLUMNS]
+
+    return [found[column] for column in BALL_COLUMNS]
 
 
-def prepare_results(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+def prepare_results(raw_df):
+    df = raw_df.copy()
 
     date_col = detect_date_column(df)
     draw_col = detect_draw_column(df)
@@ -242,192 +223,257 @@ def prepare_results(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("No se encontró la columna Fecha.")
 
     rename = {date_col: "Fecha"}
-    if draw_col:
+
+    if draw_col is not None:
         rename[draw_col] = "Sorteo"
 
-    for i, c in enumerate(ball_cols, 1):
-        rename[c] = f"Bolilla {i}"
+    for i, column in enumerate(ball_cols, 1):
+        rename[column] = f"Bolilla {i}"
 
     df = df.rename(columns=rename)
 
-    df["Fecha"] = pd.to_datetime(df["Fecha"], errors="coerce", dayfirst=True)
+    df["Fecha"] = pd.to_datetime(
+        df["Fecha"],
+        errors="coerce",
+        dayfirst=True,
+    )
 
     if "Sorteo" not in df.columns:
         df["Sorteo"] = np.arange(1, len(df) + 1)
 
-    df["Sorteo"] = pd.to_numeric(df["Sorteo"], errors="coerce")
+    df["Sorteo"] = pd.to_numeric(
+        df["Sorteo"],
+        errors="coerce",
+    )
 
-    for c in BALL_COLUMNS:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+    for column in BALL_COLUMNS:
+        df[column] = pd.to_numeric(
+            df[column],
+            errors="coerce",
+        )
 
-    before = len(df)
-    df = df.dropna(subset=["Fecha"] + BALL_COLUMNS).copy()
-    dropped = before - len(df)
+    original_rows = len(df)
 
-    for c in BALL_COLUMNS:
-        df[c] = df[c].astype(int)
+    # Solo se excluyen filas sin fecha o sin alguna de las seis
+    # bolillas principales. Las columnas auxiliares se conservan.
+    df = df.dropna(
+        subset=["Fecha"] + BALL_COLUMNS
+    ).copy()
 
-    df = df.sort_values(["Fecha", "Sorteo"]).reset_index(drop=True)
+    rows_dropped = original_rows - len(df)
 
-    # Conservamos columnas auxiliares del archivo.
+    for column in BALL_COLUMNS:
+        df[column] = df[column].astype(int)
+
+    df["Sorteo"] = df["Sorteo"].astype("Int64")
+
     if "Premio" in df.columns:
-        df["Premio"] = pd.to_numeric(df["Premio"], errors="coerce")
+        df["Premio"] = pd.to_numeric(
+            df["Premio"],
+            errors="coerce",
+        )
 
-    df.attrs["rows_dropped"] = dropped
+    df = df.sort_values(
+        ["Fecha", "Sorteo"]
+    ).reset_index(drop=True)
+
+    df.attrs["rows_dropped"] = rows_dropped
+
     return df
 
 
 # ==============================================================
-# DETECCIÓN DE REVENTONES POR COLOR
+# DETECCIÓN DEL RESALTADO VERDE EN PREMIO
 # ==============================================================
 
-def is_green_fill(cell) -> bool:
-    """Detecta el resaltado verde usado en el Excel del usuario."""
+def is_green_fill(cell):
     fill = cell.fill
+
     if not fill or fill.fill_type != "solid":
         return False
 
     fg = fill.fgColor
 
-    # En el Excel analizado, el verde corresponde al tema 9.
     if fg.type == "theme" and fg.theme == 9:
         return True
 
     if fg.type == "rgb" and fg.rgb:
         rgb = str(fg.rgb)[-6:].upper()
+
         try:
-            r = int(rgb[0:2], 16)
-            g = int(rgb[2:4], 16)
-            b = int(rgb[4:6], 16)
-            return g > r * 1.15 and g > b * 1.05 and g > 90
-        except Exception:
+            red = int(rgb[0:2], 16)
+            green = int(rgb[2:4], 16)
+            blue = int(rgb[4:6], 16)
+
+            return (
+                green > red * 1.15
+                and green > blue * 1.05
+                and green > 90
+            )
+        except (ValueError, TypeError):
             return False
 
     return False
 
 
 @st.cache_data(show_spinner=False)
-def detect_green_prizes(file_bytes: bytes, signature: str) -> pd.DataFrame:
-    """Lee estilo de la columna Premio sin alterar los datos."""
-    wb = load_workbook(io.BytesIO(file_bytes), data_only=False)
+def detect_green_prizes(file_bytes: bytes):
+    wb = load_workbook(
+        io.BytesIO(file_bytes),
+        data_only=False,
+    )
+
     if "Resultados" not in wb.sheetnames:
-        return pd.DataFrame(columns=["Sorteo", "Fecha", "ReventoVerde"])
+        return pd.DataFrame(
+            columns=["Fecha", "Sorteo", "ReventoVerde"]
+        )
 
     ws = wb["Resultados"]
-    headers = {str(c.value).strip(): c.column for c in ws[1] if c.value is not None}
 
-    date_col = headers.get("Fecha")
-    draw_col = headers.get("Sorteo")
-    prize_col = headers.get("Premio")
+    headers = {
+        normalize_text(cell.value): cell.column
+        for cell in ws[1]
+        if cell.value is not None
+    }
+
+    date_col = headers.get("fecha")
+    draw_col = headers.get("sorteo")
+    prize_col = headers.get("premio")
 
     if not date_col or not draw_col or not prize_col:
-        return pd.DataFrame(columns=["Sorteo", "Fecha", "ReventoVerde"])
+        return pd.DataFrame(
+            columns=["Fecha", "Sorteo", "ReventoVerde"]
+        )
 
     records = []
-    for row in range(2, ws.max_row + 1):
-        date_value = ws.cell(row, date_col).value
-        draw_value = ws.cell(row, draw_col).value
-        prize_cell = ws.cell(row, prize_col)
+
+    for row_num in range(2, ws.max_row + 1):
+        date_value = ws.cell(row_num, date_col).value
+        draw_value = ws.cell(row_num, draw_col).value
+        prize_cell = ws.cell(row_num, prize_col)
 
         if draw_value is None:
             continue
 
-        records.append(
-            {
-                "Sorteo": pd.to_numeric(draw_value, errors="coerce"),
-                "Fecha": pd.to_datetime(date_value, errors="coerce"),
-                "ReventoVerde": bool(is_green_fill(prize_cell)),
-            }
-        )
+        records.append({
+            "Fecha": pd.to_datetime(
+                date_value,
+                errors="coerce",
+                dayfirst=True,
+            ),
+            "Sorteo": pd.to_numeric(
+                draw_value,
+                errors="coerce",
+            ),
+            "ReventoVerde": is_green_fill(prize_cell),
+            "PremioCeldaConDato": prize_cell.value is not None,
+        })
 
     return pd.DataFrame(records)
 
 
-def attach_prize_features(
-    df: pd.DataFrame,
-    file_bytes: bytes,
-    signature: str,
-) -> pd.DataFrame:
-    """
-    Integra premios/reventones respetando datos faltantes.
-
-    ReventoVerde:
-      True  = confirmado por resaltado verde.
-      False = existe premio documentado y no está marcado en verde.
-      NA    = no existe información suficiente.
-    """
-    out = df.copy().sort_values(["Fecha", "Sorteo"]).reset_index(drop=True)
+def attach_prize_features(df, file_bytes):
+    out = df.copy()
 
     if "Premio" not in out.columns:
         out["Premio"] = np.nan
-    out["Premio"] = pd.to_numeric(out["Premio"], errors="coerce")
 
-    green = detect_green_prizes(file_bytes, signature)
+    out["Premio"] = pd.to_numeric(
+        out["Premio"],
+        errors="coerce",
+    )
+
+    green = detect_green_prizes(file_bytes)
+
+    out["FechaClave"] = pd.to_datetime(
+        out["Fecha"],
+        errors="coerce",
+    ).dt.normalize()
+
+    out["SorteoClave"] = pd.to_numeric(
+        out["Sorteo"],
+        errors="coerce",
+    ).astype("Int64")
 
     if not green.empty:
-        green = green.dropna(subset=["Sorteo"]).copy()
-        green["Sorteo"] = pd.to_numeric(
-            green["Sorteo"], errors="coerce"
-        ).astype("Int64")
-        out["Sorteo"] = pd.to_numeric(
-            out["Sorteo"], errors="coerce"
+        green["FechaClave"] = pd.to_datetime(
+            green["Fecha"],
+            errors="coerce",
+        ).dt.normalize()
+
+        green["SorteoClave"] = pd.to_numeric(
+            green["Sorteo"],
+            errors="coerce",
         ).astype("Int64")
 
-        green_map = green[["Sorteo", "ReventoVerde"]].drop_duplicates("Sorteo")
-        out = out.merge(green_map, on="Sorteo", how="left", suffixes=("", "_green"))
-
-        if "ReventoVerde_green" in out.columns:
-            # Caso en que la tabla base ya traía una columna con ese nombre.
-            out["ReventoVerde"] = out["ReventoVerde_green"].astype("boolean")
-            out = out.drop(columns=["ReventoVerde_green"], errors="ignore")
-        elif "ReventoVerde" in out.columns:
-            # Caso normal: la columna proviene directamente de green_map.
-            out["ReventoVerde"] = out["ReventoVerde"].astype("boolean")
-        else:
-            out["ReventoVerde"] = pd.Series(
-                pd.NA, index=out.index, dtype="boolean"
-            )
-    else:
-        out["ReventoVerde"] = pd.Series(
-            pd.NA, index=out.index, dtype="boolean"
+        # Vinculación por ambas claves para evitar que números de
+        # sorteo repetidos o inconsistentes mezclen los registros.
+        green = green.drop_duplicates(
+            ["FechaClave", "SorteoClave"],
+            keep="last",
         )
 
-    # Si el monto del premio existe y no hay marca verde, podemos clasificar
-    # el reventón como "no marcado" dentro del archivo. Si el monto falta,
-    # permanece desconocido.
-    out.loc[
-        out["ReventoVerde"].isna() & out["Premio"].notna(),
-        "ReventoVerde"
-    ] = False
+        green = green[
+            [
+                "FechaClave",
+                "SorteoClave",
+                "ReventoVerde",
+                "PremioCeldaConDato",
+            ]
+        ]
+
+        out = out.merge(
+            green,
+            on=["FechaClave", "SorteoClave"],
+            how="left",
+            validate="many_to_one",
+        )
+
+        # El resaltado verde confirma el reventón.
+        # Una celda sin dato de premio permanece desconocida.
+        no_mark_with_prize = (
+            out["ReventoVerde"].isna()
+            & out["Premio"].notna()
+        )
+
+        out.loc[no_mark_with_prize, "ReventoVerde"] = False
+
+    else:
+        out["ReventoVerde"] = pd.NA
+
+    out["ReventoVerde"] = out["ReventoVerde"].astype("boolean")
 
     out["ReventoConocido"] = out["ReventoVerde"].notna()
-
     out["PremioAnterior"] = out["Premio"].shift(1)
+
     out["PremioCambioPct"] = (
         (out["Premio"] - out["PremioAnterior"])
         / out["PremioAnterior"].replace(0, np.nan)
     )
 
-    # Variables disponibles ANTES del sorteo actual.
-    out["ReventoAnterior"] = out["ReventoVerde"].shift(1).astype("boolean")
-    out["PremioConocidoAntes"] = out["PremioAnterior"]
+    out["ReventoAnterior"] = (
+        out["ReventoVerde"].shift(1).astype("boolean")
+    )
 
+    # Número de sorteos conocidos consecutivos sin reventón.
+    # Si aparece un dato desconocido, la racha deja de estimarse.
     streak = []
-    n = 0
+    count = 0
     known = True
 
     for value in out["ReventoVerde"].tolist():
-        streak.append(float(n) if known else np.nan)
+        if known:
+            streak.append(count)
+        else:
+            streak.append(np.nan)
 
         if pd.isna(value):
-            # No sabemos si hubo o no reventón en este período.
-            # No continuamos acumulando una racha inventada.
             known = False
         elif bool(value):
-            n = 0
+            count = 0
             known = True
         else:
-            n += 1
+            count += 1
             known = True
 
     out["SorteosSinReventarAntes"] = streak
@@ -443,62 +489,82 @@ def attach_prize_features(
                 (row["Fecha"] - last_revent_date).days
             )
 
-        if (
-            pd.notna(row["ReventoVerde"])
-            and bool(row["ReventoVerde"])
-        ):
+        value = row["ReventoVerde"]
+
+        if pd.notna(value) and bool(value):
             last_revent_date = row["Fecha"]
 
     out["DiasDesdeUltimoReventonAntes"] = days_since
     out["PremioDisponible"] = out["Premio"].notna()
 
-    return out
+    return out.drop(
+        columns=["FechaClave", "SorteoClave", "PremioCeldaConDato"],
+        errors="ignore",
+    )
 
 
 # ==============================================================
-# UNIVERSO HISTÓRICO
+# UNIVERSO HISTÓRICO: HOJA MODIFICACIONES
 # ==============================================================
 
-def prepare_universe_schedule(sheets: Dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """
-    Usa la hoja Modificaciones.
-    La regla utilizada es: para una fecha determinada, toma la última
-    Fecha Inicio que ya entró en vigencia.
-    """
+def prepare_universe_schedule(sheets):
     if "Modificaciones" not in sheets:
         return pd.DataFrame()
 
     mod = sheets["Modificaciones"].copy()
 
-    date_start = next(
-        (c for c in mod.columns if normalize_text(c) == "fecha inicio"),
-        None,
-    )
-    total_col = next(
-        (c for c in mod.columns if "total bolillas" in normalize_text(c)),
+    date_col = next(
+        (
+            c for c in mod.columns
+            if normalize_text(c) == "fecha inicio"
+        ),
         None,
     )
 
-    if date_start is None or total_col is None:
+    total_col = next(
+        (
+            c for c in mod.columns
+            if "total bolillas" in normalize_text(c)
+        ),
+        None,
+    )
+
+    if date_col is None or total_col is None:
         return pd.DataFrame()
 
-    mod["Fecha Inicio"] = pd.to_datetime(mod[date_start], errors="coerce", dayfirst=True)
-    mod["Total Bolillas"] = pd.to_numeric(mod[total_col], errors="coerce")
-    mod = mod.dropna(subset=["Fecha Inicio", "Total Bolillas"]).copy()
+    mod["Fecha Inicio"] = pd.to_datetime(
+        mod[date_col],
+        errors="coerce",
+        dayfirst=True,
+    )
+
+    mod["Total Bolillas"] = pd.to_numeric(
+        mod[total_col],
+        errors="coerce",
+    )
+
+    mod = mod.dropna(
+        subset=["Fecha Inicio", "Total Bolillas"]
+    ).copy()
+
     mod["Total Bolillas"] = mod["Total Bolillas"].astype(int)
-    return mod.sort_values("Fecha Inicio").reset_index(drop=True)
+
+    mod = mod.sort_values(
+        "Fecha Inicio"
+    ).reset_index(drop=True)
+
+    return mod
 
 
-def universe_for_date(
-    target_date,
-    schedule: pd.DataFrame,
-    fallback: int = 53,
-) -> int:
+def universe_for_date(target_date, schedule, fallback=53):
     if schedule.empty:
         return fallback
 
-    target = pd.Timestamp(target_date)
-    valid = schedule[schedule["Fecha Inicio"] <= target]
+    target = pd.Timestamp(target_date).normalize()
+
+    valid = schedule[
+        schedule["Fecha Inicio"].dt.normalize() <= target
+    ]
 
     if valid.empty:
         return int(schedule.iloc[0]["Total Bolillas"])
@@ -506,139 +572,98 @@ def universe_for_date(
     return int(valid.iloc[-1]["Total Bolillas"])
 
 
-def add_historical_universe(df: pd.DataFrame, schedule: pd.DataFrame) -> pd.DataFrame:
+def add_historical_universe(df, schedule):
     out = df.copy()
+
     out["UniversoVigente"] = [
-        universe_for_date(d, schedule) for d in out["Fecha"]
+        universe_for_date(value, schedule)
+        for value in out["Fecha"]
     ]
+
     return out
 
 
-def get_ball_universe(df: pd.DataFrame) -> List[int]:
-    values = set()
-    for c in BALL_COLUMNS:
-        values.update(pd.to_numeric(df[c], errors="coerce").dropna().astype(int).tolist())
-    return sorted(values)
+# ==============================================================
+# VALIDACIÓN Y RESUMEN DE DATOS
+# ==============================================================
 
-
-def get_historical_universe_until(
-    df: pd.DataFrame,
-    cutoff_date=None,
-) -> List[int]:
-    if cutoff_date is not None:
-        d = df[df["Fecha"] < pd.Timestamp(cutoff_date)]
-    else:
-        d = df
-
-    return get_ball_universe(d)
-
-
-def valid_numbers_for_training(
-    train: pd.DataFrame,
-    cutoff_date,
-    schedule: pd.DataFrame,
-) -> List[int]:
-    """Universo oficial vigente en el momento del objetivo, restringido al histórico disponible."""
-    n = universe_for_date(cutoff_date, schedule)
-    # El universo oficial es 1..n. No usamos solo números observados:
-    # un número válido puede no haber aparecido todavía.
-    return list(range(1, n + 1))
-
-
-def safe_bool(value):
-    """Convierte valores a bool sin fallar con NaN o pd.NA."""
-    if value is None:
-        return None
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
-    return bool(value)
-
-
-def prize_coverage(df: pd.DataFrame) -> Dict:
-    """Calcula la cobertura real de premios y reventones."""
+def prize_coverage(df):
     total = len(df)
 
-    if total == 0:
-        return {
-            "total": 0,
-            "premios": 0,
-            "cobertura_premio_pct": 0.0,
-            "reventones_confirmados": 0,
-            "reventones_conocidos": 0,
-            "cobertura_reventon_pct": 0.0,
-        }
+    prizes = (
+        int(df["Premio"].notna().sum())
+        if "Premio" in df else 0
+    )
 
-    premios = int(df["Premio"].notna().sum()) if "Premio" in df else 0
-    conocidos = (
-        int(df["ReventoVerde"].notna().sum())
-        if "ReventoVerde" in df else 0
-    )
-    confirmados = (
-        int(df["ReventoVerde"].fillna(False).astype(bool).sum())
-        if "ReventoVerde" in df else 0
-    )
+    if "ReventoVerde" in df:
+        known = int(df["ReventoVerde"].notna().sum())
+        confirmed = int(
+            df["ReventoVerde"].fillna(False).astype(bool).sum()
+        )
+    else:
+        known = 0
+        confirmed = 0
 
     return {
         "total": total,
-        "premios": premios,
-        "cobertura_premio_pct": premios / total * 100,
-        "reventones_confirmados": confirmados,
-        "reventones_conocidos": conocidos,
-        "cobertura_reventon_pct": conocidos / total * 100,
+        "premios": prizes,
+        "cobertura_premio_pct": prizes / total * 100 if total else 0,
+        "reventones_confirmados": confirmed,
+        "reventones_conocidos": known,
+        "cobertura_reventon_pct": known / total * 100 if total else 0,
     }
 
 
-# ==============================================================
-# VALIDACIÓN
-# ==============================================================
-
-def validate_data(df: pd.DataFrame) -> Dict:
-    duplicate_draws = int(df["Sorteo"].duplicated(keep=False).sum())
-    exact_duplicates = int(df.duplicated().sum())
-
+def validate_data(df):
     repeated_balls = 0
     out_of_range = 0
 
     for _, row in df.iterrows():
-        vals = [int(row[c]) for c in BALL_COLUMNS]
-        if len(set(vals)) < 6:
+        values = [int(row[c]) for c in BALL_COLUMNS]
+
+        if len(set(values)) != 6:
             repeated_balls += 1
-        if any(v < 1 or v > 100 for v in vals):
+
+        universe = int(row.get("UniversoVigente", 53))
+
+        if any(n < 1 or n > universe for n in values):
             out_of_range += 1
 
-    historical_combos = {
+    combinations_seen = {
         tuple(sorted(int(row[c]) for c in BALL_COLUMNS))
         for _, row in df.iterrows()
     }
+
+    observed = [
+        int(n)
+        for c in BALL_COLUMNS
+        for n in df[c].dropna().tolist()
+    ]
+
+    coverage = prize_coverage(df)
 
     return {
         "records": len(df),
         "min_date": df["Fecha"].min(),
         "max_date": df["Fecha"].max(),
-        "duplicate_draws": duplicate_draws,
-        "exact_duplicates": exact_duplicates,
+        "duplicate_draws": int(df["Sorteo"].duplicated(keep=False).sum()),
+        "exact_duplicates": int(df.duplicated().sum()),
         "repeated_balls": repeated_balls,
         "out_of_range": out_of_range,
-        "unique_combinations": len(historical_combos),
-        "universe_min": min(get_ball_universe(df)) if len(df) else None,
-        "universe_max": max(get_ball_universe(df)) if len(df) else None,
-        "reventones": (
-            int(df["ReventoVerde"].fillna(False).astype(bool).sum())
-            if "ReventoVerde" in df else 0
-        ),
-        "premio_cobertura_pct": prize_coverage(df)["cobertura_premio_pct"],
-        "reventon_cobertura_pct": prize_coverage(df)["cobertura_reventon_pct"],
+        "unique_combinations": len(combinations_seen),
+        "universe_min": min(observed) if observed else None,
+        "universe_max": max(observed) if observed else None,
+        "reventones": coverage["reventones_confirmados"],
+        "premio_cobertura_pct": coverage["cobertura_premio_pct"],
+        "reventon_cobertura_pct": coverage["cobertura_reventon_pct"],
     }
 
 
 # ==============================================================
-# ESTADÍSTICAS DE NÚMEROS
+# FRECUENCIAS Y ATRASOS
 # ==============================================================
 
-def calculate_frequency(df: pd.DataFrame, decay_lambda: float = 0.0) -> Counter:
+def calculate_frequency(df, decay_lambda=0.0):
     freq = Counter()
 
     if df.empty:
@@ -647,231 +672,217 @@ def calculate_frequency(df: pd.DataFrame, decay_lambda: float = 0.0) -> Counter:
     max_date = df["Fecha"].max()
 
     for _, row in df.iterrows():
-        weight = 1.0
+        days = (max_date - row["Fecha"]).days
 
-        if decay_lambda > 0:
-            days = (max_date - row["Fecha"]).days
-            weight = np.exp(-decay_lambda * days)
+        weight = (
+            np.exp(-decay_lambda * days)
+            if decay_lambda > 0 else 1.0
+        )
 
-        for c in BALL_COLUMNS:
-            freq[int(row[c])] += weight
+        for column in BALL_COLUMNS:
+            freq[int(row[column])] += float(weight)
 
     return freq
 
 
-def calculate_delay(df: pd.DataFrame, universe: List[int]) -> Dict[int, float]:
-    if df.empty:
-        return {n: np.nan for n in universe}
-
-    last_date = df["Fecha"].max()
-    result = {}
-
-    for n in universe:
-        dates = df.loc[
-            (df[BALL_COLUMNS] == n).any(axis=1), "Fecha"
-        ]
-        if dates.empty:
-            result[n] = np.nan
-        else:
-            result[n] = float((last_date - dates.max()).days)
-
-    return result
-
-
-def minmax_dict(values: Dict[int, float], neutral: float = 0.5) -> Dict[int, float]:
-    finite = [v for v in values.values() if pd.notna(v) and np.isfinite(v)]
+def minmax_dict(values, neutral=0.5):
+    finite = [
+        float(v)
+        for v in values.values()
+        if pd.notna(v) and np.isfinite(v)
+    ]
 
     if not finite:
-        return {k: neutral for k in values}
+        return {key: neutral for key in values}
 
     lo, hi = min(finite), max(finite)
 
     if hi == lo:
-        return {k: neutral for k in values}
+        return {key: neutral for key in values}
 
     return {
-        k: neutral if pd.isna(v) else (v - lo) / (hi - lo)
-        for k, v in values.items()
-    }
-
-
-def calculate_contextual_ball_scores(
-    df: pd.DataFrame,
-    universe: List[int],
-    current_reventon_context: bool,
-    blend_context: float = 0.20,
-) -> Dict[int, float]:
-    """
-    Compara la frecuencia de cada número en sorteos cuyo estado previo
-    fue igual al contexto actual. Es una variable experimental/descriptiva,
-    no una afirmación de causalidad.
-    """
-    base = calculate_ball_scores(df, universe, 0.65, 0.35)
-
-    if "ReventoAnterior" not in df.columns:
-        return base
-
-    # ReventoAnterior puede contener pd.NA/NaN porque el reventón histórico
-    # no está documentado para todos los sorteos. No convertir toda la serie
-    # a bool: astype(bool) falla cuando existen valores faltantes.
-    context_value = safe_bool(current_reventon_context)
-    if context_value is None:
-        return base
-
-    contextual_mask = df["ReventoAnterior"].eq(context_value).fillna(False)
-    contextual = df.loc[contextual_mask].copy()
-
-    # Evitar que una muestra contextual demasiado pequeña domine el modelo.
-    if len(contextual) < 20:
-        return base
-
-    context_freq = calculate_frequency(contextual, 0)
-    context_values = {n: context_freq[n] for n in universe}
-    context_norm = minmax_dict(context_values)
-
-    return {
-        n: (1 - blend_context) * base[n] + blend_context * context_norm[n]
-        for n in universe
+        key: (
+            neutral
+            if pd.isna(value)
+            else (float(value) - lo) / (hi - lo)
+        )
+        for key, value in values.items()
     }
 
 
 def calculate_ball_scores(
-    df: pd.DataFrame,
-    universe: List[int],
-    historical_weight: float = 0.65,
-    recent_weight: float = 0.35,
-) -> Dict[int, float]:
-    hist = calculate_frequency(df, 0)
+    df,
+    universe,
+    historical_weight=0.65,
+    recent_weight=0.35,
+):
+    historical = calculate_frequency(df, 0)
     recent = calculate_frequency(df, 0.003)
 
-    hist_values = {n: hist[n] for n in universe}
-    recent_values = {n: recent[n] for n in universe}
+    hist_norm = minmax_dict({
+        n: historical[n] for n in universe
+    })
 
-    h = minmax_dict(hist_values)
-    r = minmax_dict(recent_values)
+    recent_norm = minmax_dict({
+        n: recent[n] for n in universe
+    })
 
     return {
-        n: historical_weight * h[n] + recent_weight * r[n]
+        n: (
+            historical_weight * hist_norm[n]
+            + recent_weight * recent_norm[n]
+        )
         for n in universe
     }
 
 
+def calculate_delay(df, universe):
+    result = {}
+
+    if df.empty:
+        return {n: np.nan for n in universe}
+
+    last_date = df["Fecha"].max()
+
+    for n in universe:
+        dates = df.loc[
+            (df[BALL_COLUMNS] == n).any(axis=1),
+            "Fecha",
+        ]
+
+        result[n] = (
+            float((last_date - dates.max()).days)
+            if not dates.empty else np.nan
+        )
+
+    return result
+
+
+def frequency_table(df, universe):
+    freq = calculate_frequency(df)
+    delay = calculate_delay(df, universe)
+    total = len(df) * 6
+
+    rows = []
+
+    for n in universe:
+        rows.append({
+            "Bolilla": n,
+            "Apariciones": int(freq[n]),
+            "% sobre bolillas": (
+                freq[n] / total * 100 if total else 0
+            ),
+            "Atraso días": delay[n],
+        })
+
+    return pd.DataFrame(rows).sort_values(
+        ["Apariciones", "Bolilla"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
+
+
 # ==============================================================
-# PARES
+# PARES Y ESTRUCTURA DE COMBINACIONES
 # ==============================================================
 
-def calculate_pair_frequency(df: pd.DataFrame) -> Counter:
+def calculate_pair_frequency(df):
     pairs = Counter()
 
     for _, row in df.iterrows():
         nums = sorted(int(row[c]) for c in BALL_COLUMNS)
+
         for pair in combinations(nums, 2):
             pairs[pair] += 1
 
     return pairs
 
 
-def pair_score(combo: Tuple[int, ...], pairs: Counter) -> float:
-    if not combo:
-        return 0.0
-    vals = [np.log1p(pairs[p]) for p in combinations(sorted(combo), 2)]
-    return float(np.mean(vals)) if vals else 0.0
+def pair_score(combo, pairs):
+    values = [
+        np.log1p(pairs[pair])
+        for pair in combinations(sorted(combo), 2)
+    ]
+
+    return float(np.mean(values)) if values else 0.0
 
 
-# ==============================================================
-# ESTRUCTURA
-# ==============================================================
-
-def get_low_threshold(universe_size: int) -> int:
-    return universe_size // 2
-
-
-def structure_distribution(combo: Tuple[int, ...], universe_size: int) -> Dict:
+def structure_distribution(combo, universe_size):
     nums = sorted(combo)
 
-    odd = sum(n % 2 for n in nums)
-    consecutive = sum(
-        1 for a, b in zip(nums, nums[1:]) if b == a + 1
-    )
-    low = sum(n <= get_low_threshold(universe_size) for n in nums)
-
     return {
-        "odd": odd,
-        "consecutive": consecutive,
-        "low": low,
+        "odd": sum(n % 2 for n in nums),
+        "consecutive": sum(
+            1 for a, b in zip(nums, nums[1:])
+            if b == a + 1
+        ),
+        "low": sum(n <= universe_size // 2 for n in nums),
         "sum": sum(nums),
     }
 
 
-def structure_statistics(df: pd.DataFrame, universe_size: int) -> Dict[str, Tuple[float, float]]:
-    values = {"odd": [], "consecutive": [], "low": [], "sum": []}
+def structure_statistics(df, universe_size):
+    values = {
+        "odd": [],
+        "consecutive": [],
+        "low": [],
+        "sum": [],
+    }
 
     for _, row in df.iterrows():
         combo = tuple(int(row[c]) for c in BALL_COLUMNS)
-        row_universe = int(row.get("UniversoVigente", universe_size))
-        s = structure_distribution(combo, row_universe)
-        for key in values:
-            values[key].append(s[key])
 
-    result = {}
+        local_universe = int(
+            row.get("UniversoVigente", universe_size)
+        )
+
+        result = structure_distribution(combo, local_universe)
+
+        for key in values:
+            values[key].append(result[key])
+
+    stats = {}
+
     for key, arr in values.items():
         if not arr:
-            result[key] = (0.0, 1.0)
+            stats[key] = (0.0, 1.0)
         else:
-            result[key] = (float(np.mean(arr)), float(np.std(arr) or 1.0))
-    return result
+            std = float(np.std(arr))
+            stats[key] = (
+                float(np.mean(arr)),
+                std if std > 0 else 1.0,
+            )
+
+    return stats
 
 
-def structure_score(
-    combo: Tuple[int, ...],
-    stats: Dict[str, Tuple[float, float]],
-    universe_size: int,
-) -> float:
-    s = structure_distribution(combo, universe_size)
-    z = []
+def structure_score(combo, stats, universe_size):
+    values = structure_distribution(combo, universe_size)
+    z_scores = []
 
     for key in ["odd", "consecutive", "low", "sum"]:
         mean, std = stats[key]
-        z.append(abs(s[key] - mean) / std if std else 0.0)
-
-    return float(np.exp(-0.5 * np.mean(z)))
-
-
-# ==============================================================
-# COMBINACIONES
-# ==============================================================
-
-def weighted_sample_without_replacement(
-    universe: List[int],
-    scores: Dict[int, float],
-    k: int,
-    rng: np.random.Generator,
-) -> Tuple[int, ...]:
-    available = list(universe)
-    chosen = []
-
-    for _ in range(k):
-        weights = np.array(
-            [max(float(scores.get(n, 0.0)), 1e-9) for n in available],
-            dtype=float,
+        z_scores.append(
+            abs(values[key] - mean) / std if std else 0.0
         )
-        weights /= weights.sum()
 
-        idx = int(rng.choice(len(available), p=weights))
-        chosen.append(available.pop(idx))
+    return float(np.exp(-0.5 * np.mean(z_scores)))
 
-    return tuple(sorted(chosen))
 
+# ==============================================================
+# VALIDACIÓN DE COMBINACIONES
+# ==============================================================
 
 def validate_combination(
-    combo: Tuple[int, ...],
-    universe: List[int],
-    min_sum: Optional[int] = None,
-    max_sum: Optional[int] = None,
-    max_consecutive: Optional[int] = None,
-    exclude_historical: bool = False,
-    historical_combinations: Optional[set] = None,
-) -> bool:
+    combo,
+    universe,
+    min_sum=None,
+    max_sum=None,
+    max_consecutive=None,
+    exclude_historical=False,
+    historical_combinations=None,
+):
+    combo = tuple(sorted(combo))
+
     if len(combo) != 6 or len(set(combo)) != 6:
         return False
 
@@ -882,79 +893,124 @@ def validate_combination(
 
     if min_sum is not None and total < min_sum:
         return False
+
     if max_sum is not None and total > max_sum:
         return False
 
     consecutive = sum(
-        1 for a, b in zip(sorted(combo), sorted(combo)[1:]) if b == a + 1
+        1 for a, b in zip(combo, combo[1:])
+        if b == a + 1
     )
 
-    if max_consecutive is not None and consecutive > max_consecutive:
+    if (
+        max_consecutive is not None
+        and consecutive > max_consecutive
+    ):
         return False
 
-    if exclude_historical and historical_combinations is not None:
-        if tuple(sorted(combo)) in historical_combinations:
-            return False
+    if (
+        exclude_historical
+        and historical_combinations is not None
+        and combo in historical_combinations
+    ):
+        return False
 
     return True
 
 
+def weighted_sample_without_replacement(
+    universe,
+    scores,
+    rng,
+):
+    available = list(universe)
+    chosen = []
+
+    for _ in range(6):
+        weights = np.array([
+            max(float(scores.get(n, 0.0)), 1e-9)
+            for n in available
+        ])
+
+        weights /= weights.sum()
+
+        index = int(rng.choice(len(available), p=weights))
+        chosen.append(available.pop(index))
+
+    return tuple(sorted(chosen))
+
+
+# ==============================================================
+# PUNTUACIÓN DE COMBINACIONES POR ESTRATEGIA
+# ==============================================================
+
 def combination_score(
-    combo: Tuple[int, ...],
-    ball_scores: Dict[int, float],
-    pairs: Counter,
-    structure_stats_: Dict,
-    universe_size: int,
-    w_ball: float = 0.60,
-    w_pair: float = 0.25,
-    w_structure: float = 0.15,
-) -> float:
-    ball = float(np.mean([ball_scores.get(n, 0.5) for n in combo]))
+    combo,
+    strategy,
+    ball_scores,
+    pairs,
+    stats,
+    universe_size,
+):
+    ball = float(np.mean([
+        ball_scores.get(n, 0.5)
+        for n in combo
+    ]))
 
     raw_pair = pair_score(combo, pairs)
-    pair_scale = max(1.0, np.log1p(max(pairs.values(), default=1)))
-    pair = min(1.0, raw_pair / pair_scale)
-
-    structure = structure_score(combo, structure_stats_, universe_size)
-
-    return (
-        w_ball * ball
-        + w_pair * pair
-        + w_structure * structure
+    pair_scale = max(
+        1.0,
+        np.log1p(max(pairs.values(), default=1)),
     )
 
+    pair = min(1.0, raw_pair / pair_scale)
+
+    structural = structure_score(
+        combo,
+        stats,
+        universe_size,
+    )
+
+    if strategy == "Frecuencia":
+        return ball
+
+    if strategy == "Frecuencia + Recencia":
+        return ball
+
+    # Modelo combina puntuación individual, pares y estructura.
+    return 0.60 * ball + 0.25 * pair + 0.15 * structural
+
+
+# ==============================================================
+# GENERACIÓN DE CANDIDATOS
+# ==============================================================
 
 def generate_candidates(
-    train: pd.DataFrame,
-    universe: List[int],
-    n_candidates: int = 5000,
-    seed: int = 12345,
-    min_sum: Optional[int] = None,
-    max_sum: Optional[int] = None,
-    max_consecutive: Optional[int] = None,
-    exclude_historical: bool = False,
-    w_ball: float = 0.60,
-    w_pair: float = 0.25,
-    w_structure: float = 0.15,
-    use_reventon_context: bool = False,
-    current_reventon_context: bool = False,
-) -> Tuple[pd.DataFrame, Dict]:
+    train,
+    universe,
+    n_candidates=5000,
+    seed=12345,
+    min_sum=None,
+    max_sum=None,
+    max_consecutive=None,
+    exclude_historical=False,
+    strategy="Modelo",
+):
     rng = np.random.default_rng(seed)
 
-    if use_reventon_context:
-        ball_scores = calculate_contextual_ball_scores(
-            train,
-            universe,
-            current_reventon_context,
-            blend_context=0.20,
+    if strategy == "Frecuencia":
+        ball_scores = calculate_ball_scores(
+            train, universe, 1.0, 0.0
         )
     else:
-        ball_scores = calculate_ball_scores(train, universe)
+        # Modelo y Frecuencia + Recencia usan puntuaciones
+        # independientes de la estrategia correspondiente.
+        ball_scores = calculate_ball_scores(
+            train, universe, 0.65, 0.35
+        )
 
     pairs = calculate_pair_frequency(train)
 
-    # El universo puede haber cambiado históricamente.
-    # Para la generación actual usamos el tamaño vigente.
     universe_size = max(universe)
     stats = structure_statistics(train, universe_size)
 
@@ -965,14 +1021,28 @@ def generate_candidates(
 
     candidates = {}
     attempts = 0
-    max_attempts = max(1000, n_candidates * 30)
+    max_attempts = max(1000, int(n_candidates) * 40)
 
-    while len(candidates) < n_candidates and attempts < max_attempts:
+    while (
+        len(candidates) < int(n_candidates)
+        and attempts < max_attempts
+    ):
         attempts += 1
 
-        combo = weighted_sample_without_replacement(
-            universe, ball_scores, 6, rng
-        )
+        if strategy == "Aleatorio":
+            combo = tuple(sorted(
+                rng.choice(
+                    universe,
+                    size=6,
+                    replace=False,
+                ).tolist()
+            ))
+        else:
+            combo = weighted_sample_without_replacement(
+                universe,
+                ball_scores,
+                rng,
+            )
 
         if not validate_combination(
             combo,
@@ -985,49 +1055,57 @@ def generate_candidates(
         ):
             continue
 
-        score = combination_score(
-            combo,
-            ball_scores,
-            pairs,
-            stats,
-            universe_size,
-            w_ball=w_ball,
-            w_pair=w_pair,
-            w_structure=w_structure,
-        )
+        if strategy == "Aleatorio":
+            score = float(rng.random())
+        else:
+            score = combination_score(
+                combo,
+                strategy,
+                ball_scores,
+                pairs,
+                stats,
+                universe_size,
+            )
 
-        candidates[combo] = score
+        # No duplicar candidatos.
+        if combo not in candidates:
+            candidates[combo] = score
 
-    rows = [
+    result = pd.DataFrame([
         {"Combinación": combo, "Score": score}
         for combo, score in candidates.items()
-    ]
-
-    result = pd.DataFrame(rows)
+    ])
 
     if not result.empty:
         result = result.sort_values(
-            "Score", ascending=False
+            "Score",
+            ascending=False,
         ).reset_index(drop=True)
 
     info = {
         "attempts": attempts,
         "generated": len(result),
-        "acceptance_rate": len(result) / attempts if attempts else 0,
-        "requested": n_candidates,
+        "acceptance_rate": (
+            len(result) / attempts if attempts else 0
+        ),
+        "requested": int(n_candidates),
     }
 
     return result, info
 
 
+# ==============================================================
+# SELECCIÓN DIVERSIFICADA
+# ==============================================================
+
 def select_top_combinations(
-    candidates: pd.DataFrame,
-    top_n: int = 3,
-    diversity: bool = True,
-    max_overlap: int = 4,
-) -> pd.DataFrame:
+    candidates,
+    top_n=3,
+    diversity=True,
+    max_overlap=3,
+):
     if candidates.empty:
-        return candidates
+        return candidates.copy()
 
     selected = []
 
@@ -1035,15 +1113,18 @@ def select_top_combinations(
         combo = tuple(row["Combinación"])
 
         if diversity:
-            if any(
-                len(set(combo) & set(prev["Combinación"])) > max_overlap
+            too_similar = any(
+                len(set(combo) & set(prev["Combinación"]))
+                > max_overlap
                 for prev in selected
-            ):
+            )
+
+            if too_similar:
                 continue
 
         selected.append(row)
 
-        if len(selected) >= top_n:
+        if len(selected) >= int(top_n):
             break
 
     return pd.DataFrame(selected).reset_index(drop=True)
@@ -1054,22 +1135,32 @@ def select_top_combinations(
 # ==============================================================
 
 def random_combinations(
-    universe: List[int],
-    n: int,
-    rng: np.random.Generator,
-    min_sum: Optional[int] = None,
-    max_sum: Optional[int] = None,
-    max_consecutive: Optional[int] = None,
-    exclude: Optional[set] = None,
-) -> List[Tuple[int, ...]]:
+    universe,
+    n,
+    rng,
+    min_sum=None,
+    max_sum=None,
+    max_consecutive=None,
+    exclude_historical=False,
+    historical_combinations=None,
+    diversity=True,
+    max_overlap=3,
+):
     results = []
     seen = set()
     attempts = 0
-    max_attempts = max(1000, n * 50)
+    max_attempts = max(1000, int(n) * 100)
 
-    while len(results) < n and attempts < max_attempts:
+    while len(results) < int(n) and attempts < max_attempts:
         attempts += 1
-        combo = tuple(sorted(rng.choice(universe, size=6, replace=False).tolist()))
+
+        combo = tuple(sorted(
+            rng.choice(
+                universe,
+                size=6,
+                replace=False,
+            ).tolist()
+        ))
 
         if combo in seen:
             continue
@@ -1080,11 +1171,15 @@ def random_combinations(
             min_sum=min_sum,
             max_sum=max_sum,
             max_consecutive=max_consecutive,
-            exclude_historical=False,
+            exclude_historical=exclude_historical,
+            historical_combinations=historical_combinations,
         ):
             continue
 
-        if exclude and combo in exclude:
+        if diversity and any(
+            len(set(combo) & set(previous)) > max_overlap
+            for previous in results
+        ):
             continue
 
         seen.add(combo)
@@ -1094,118 +1189,127 @@ def random_combinations(
 
 
 # ==============================================================
-# BACKTESTING
+# BACKTESTING WALK-FORWARD
 # ==============================================================
 
-def evaluate_combination(combo: Tuple[int, ...], actual: Tuple[int, ...]) -> int:
+def evaluate_combination(combo, actual):
     return len(set(combo) & set(actual))
 
 
-def evaluate_ticket_set(
-    tickets: List[Tuple[int, ...]],
-    actual: Tuple[int, ...],
-) -> Dict:
-    hits = [evaluate_combination(c, actual) for c in tickets]
+def evaluate_ticket_set(tickets, actual):
+    hits = [
+        evaluate_combination(combo, actual)
+        for combo in tickets
+    ]
 
     return {
         "max_hits": max(hits) if hits else 0,
         "mean_hits": float(np.mean(hits)) if hits else 0.0,
-        "hits_2_plus": int(sum(h >= 2 for h in hits)),
-        "hits_3_plus": int(sum(h >= 3 for h in hits)),
-        "hits_4_plus": int(sum(h >= 4 for h in hits)),
+        "hits_2_plus": sum(h >= 2 for h in hits),
+        "hits_3_plus": sum(h >= 3 for h in hits),
+        "hits_4_plus": sum(h >= 4 for h in hits),
     }
 
 
 def backtest_strategy(
-    df: pd.DataFrame,
-    schedule: pd.DataFrame,
-    min_train: int = 200,
-    step: int = 1,
-    top_n: int = 10,
-    n_candidates: int = 1500,
-    min_sum: Optional[int] = None,
-    max_sum: Optional[int] = None,
-    max_consecutive: Optional[int] = None,
-    strategy: str = "Modelo",
-    exclude_historical: bool = False,
-    use_reventon_feature: bool = False,
+    df,
+    schedule,
+    min_train=200,
+    step=1,
+    top_n=10,
+    n_candidates=1000,
+    min_sum=None,
+    max_sum=None,
+    max_consecutive=None,
+    strategy="Modelo",
+    exclude_historical=False,
+    diversity=True,
+    max_overlap=3,
     progress_callback=None,
-    progress_offset: int = 0,
-    progress_total: int = 1,
-) -> pd.DataFrame:
-    """Backtesting walk-forward. progress_callback(done,total,strategy)."""
-    data = df.sort_values(["Fecha", "Sorteo"]).reset_index(drop=True)
-    step = max(1, int(step))
+    progress_offset=0,
+    progress_total=1,
+):
+    data = df.sort_values(
+        ["Fecha", "Sorteo"]
+    ).reset_index(drop=True)
+
     min_train = max(1, int(min_train))
+    step = max(1, int(step))
+
     test_indices = list(range(min_train, len(data), step))
     records = []
 
     for local_idx, test_index in enumerate(test_indices, 1):
-        train = data.iloc[:test_index]
+        # Solo se utiliza información anterior al sorteo objetivo.
+        train = data.iloc[:test_index].copy()
         actual_row = data.iloc[test_index]
-        actual = tuple(int(actual_row[c]) for c in BALL_COLUMNS)
 
-        universe_size = universe_for_date(actual_row["Fecha"], schedule)
+        actual = tuple(
+            int(actual_row[c])
+            for c in BALL_COLUMNS
+        )
+
+        universe_size = universe_for_date(
+            actual_row["Fecha"],
+            schedule,
+        )
+
         universe = list(range(1, universe_size + 1))
 
-        if use_reventon_feature:
-            prev_revent_raw = train.iloc[-1]["ReventoVerde"]
-            streak_raw = train.iloc[-1]["SorteosSinReventarAntes"]
-            prev_revent_value = safe_bool(prev_revent_raw)
-            if prev_revent_value is None or pd.isna(streak_raw):
-                prev_revent = "desconocido"
-                streak = "desconocido"
-            else:
-                prev_revent = bool(prev_revent_value)
-                streak = int(float(streak_raw)) + (0 if prev_revent else 1)
-            seed_context = f"{strategy}|{actual_row['Fecha'].date()}|{prev_revent}|{streak}"
-        else:
-            seed_context = f"{strategy}|{actual_row['Fecha'].date()}"
+        seed = stable_seed(
+            "backtest",
+            strategy,
+            str(actual_row["Fecha"]),
+            int(test_index),
+        )
 
-        seed = stable_seed("backtest", seed_context, test_index)
+        historical_combinations = {
+            tuple(sorted(int(row[c]) for c in BALL_COLUMNS))
+            for _, row in train.iterrows()
+        }
 
         if strategy == "Aleatorio":
             rng = np.random.default_rng(seed)
+
             tickets = random_combinations(
-                universe, top_n, rng,
-                min_sum=min_sum, max_sum=max_sum,
+                universe,
+                top_n,
+                rng,
+                min_sum=min_sum,
+                max_sum=max_sum,
                 max_consecutive=max_consecutive,
+                exclude_historical=exclude_historical,
+                historical_combinations=historical_combinations,
+                diversity=diversity,
+                max_overlap=max_overlap,
             )
         else:
             candidates, _ = generate_candidates(
-                train=train, universe=universe, n_candidates=n_candidates,
-                seed=seed, min_sum=min_sum, max_sum=max_sum,
+                train=train,
+                universe=universe,
+                n_candidates=n_candidates,
+                seed=seed,
+                min_sum=min_sum,
+                max_sum=max_sum,
                 max_consecutive=max_consecutive,
                 exclude_historical=exclude_historical,
-                use_reventon_context=use_reventon_feature,
-                current_reventon_context=(
-                    safe_bool(train.iloc[-1]["ReventoVerde"])
-                    if use_reventon_feature and "ReventoVerde" in train.columns
-                    else False
-                ),
+                strategy=strategy,
             )
 
-            if strategy == "Frecuencia":
-                scores = calculate_ball_scores(train, universe, 1.0, 0.0)
-                if not candidates.empty:
-                    candidates = candidates.copy()
-                    candidates["StrategyScore"] = candidates["Combinación"].apply(
-                        lambda c: float(np.mean([scores[n] for n in c]))
-                    )
-                    candidates = candidates.sort_values("StrategyScore", ascending=False)
-            elif strategy == "Frecuencia + Recencia":
-                scores = calculate_ball_scores(train, universe, 0.65, 0.35)
-                if not candidates.empty:
-                    candidates = candidates.copy()
-                    candidates["StrategyScore"] = candidates["Combinación"].apply(
-                        lambda c: float(np.mean([scores[n] for n in c]))
-                    )
-                    candidates = candidates.sort_values("StrategyScore", ascending=False)
+            selected = select_top_combinations(
+                candidates,
+                top_n=top_n,
+                diversity=diversity,
+                max_overlap=max_overlap,
+            )
 
-            selected = select_top_combinations(candidates, top_n=top_n, diversity=True)
-            tickets = [tuple(x) for x in selected["Combinación"].tolist()] if not selected.empty else []
+            tickets = (
+                [tuple(combo) for combo in selected["Combinación"]]
+                if not selected.empty else []
+            )
 
         metrics = evaluate_ticket_set(tickets, actual)
+
         records.append({
             "Fecha": actual_row["Fecha"],
             "Sorteo": actual_row["Sorteo"],
@@ -1215,58 +1319,43 @@ def backtest_strategy(
         })
 
         if progress_callback is not None:
-            progress_callback(progress_offset + local_idx, progress_total, strategy)
+            progress_callback(
+                progress_offset + local_idx,
+                progress_total,
+                strategy,
+            )
 
     return pd.DataFrame(records)
 
-def summarize_backtest(results: pd.DataFrame) -> pd.DataFrame:
+
+def summarize_backtest(results):
     if results.empty:
         return pd.DataFrame()
 
-    grouped = []
+    summary = []
 
-    for strategy, g in results.groupby("Estrategia"):
-        grouped.append(
-            {
-                "Estrategia": strategy,
-                "Pruebas": len(g),
-                "Promedio máximo aciertos": g["max_hits"].mean(),
-                "Mediana máximo aciertos": g["max_hits"].median(),
-                "% pruebas con ≥2": (g["max_hits"] >= 2).mean() * 100,
-                "% pruebas con ≥3": (g["max_hits"] >= 3).mean() * 100,
-                "% pruebas con ≥4": (g["max_hits"] >= 4).mean() * 100,
-                "Máximo observado": g["max_hits"].max(),
-            }
-        )
+    for strategy, group in results.groupby("Estrategia"):
+        summary.append({
+            "Estrategia": strategy,
+            "Pruebas": len(group),
+            "Promedio máximo aciertos": group["max_hits"].mean(),
+            "Mediana máximo aciertos": group["max_hits"].median(),
+            "% pruebas con ≥2": (
+                group["max_hits"].ge(2).mean() * 100
+            ),
+            "% pruebas con ≥3": (
+                group["max_hits"].ge(3).mean() * 100
+            ),
+            "% pruebas con ≥4": (
+                group["max_hits"].ge(4).mean() * 100
+            ),
+            "Máximo observado": group["max_hits"].max(),
+            "Promedio de tickets": group["Tickets"].mean(),
+        })
 
-    return pd.DataFrame(grouped)
-
-
-# ==============================================================
-# TABLA DE FRECUENCIAS
-# ==============================================================
-
-def frequency_table(df: pd.DataFrame, universe: List[int]) -> pd.DataFrame:
-    freq = calculate_frequency(df, 0)
-    delay = calculate_delay(df, universe)
-
-    total_balls = len(df) * 6
-
-    rows = []
-    for n in universe:
-        rows.append(
-            {
-                "Bolilla": n,
-                "Apariciones": int(freq[n]),
-                "% sobre bolillas": (
-                    freq[n] / total_balls * 100 if total_balls else 0
-                ),
-                "Atraso días": delay[n],
-            }
-        )
-
-    return pd.DataFrame(rows).sort_values(
-        ["Apariciones", "Bolilla"], ascending=[False, True]
+    return pd.DataFrame(summary).sort_values(
+        "Promedio máximo aciertos",
+        ascending=False,
     ).reset_index(drop=True)
 
 
@@ -1274,164 +1363,179 @@ def frequency_table(df: pd.DataFrame, universe: List[int]) -> pd.DataFrame:
 # EXPORTACIÓN
 # ==============================================================
 
-def candidates_to_dataframe(df_candidates: pd.DataFrame) -> pd.DataFrame:
-    if df_candidates.empty:
+def candidates_to_dataframe(candidates):
+    if candidates.empty:
         return pd.DataFrame()
 
     rows = []
-    for rank, (_, row) in enumerate(df_candidates.iterrows(), 1):
+
+    for rank, (_, row) in enumerate(candidates.iterrows(), 1):
         combo = tuple(row["Combinación"])
+
         item = {
             "Ranking": rank,
             "Combinación": "-".join(f"{n:02d}" for n in combo),
-            "Score": row.get("Score", row.get("StrategyScore", np.nan)),
+            "Score": row["Score"],
         }
-        for i, n in enumerate(combo, 1):
-            item[f"Bolilla {i}"] = n
+
+        for i, number in enumerate(combo, 1):
+            item[f"Bolilla {i}"] = number
+
         rows.append(item)
 
     return pd.DataFrame(rows)
 
 
 # ==============================================================
-# INTERFAZ
+# PROGRAMACIÓN DE SORTEOS
+# ==============================================================
+
+def proximo_sorteo():
+    now = datetime.now(ZoneInfo("America/Lima"))
+    target = now.date()
+
+    # Calendario utilizado por esta aplicación.
+    draw_weekdays = {2: "miércoles", 6: "domingo"}
+
+    while target.weekday() not in draw_weekdays:
+        target += timedelta(days=1)
+
+    return target, draw_weekdays[target.weekday()]
+
+
+# ==============================================================
+# INTERFAZ PRINCIPAL
 # ==============================================================
 
 def main():
-
     st.title("🎱 LA TINKA AI")
+
     st.caption(
-        f"Sistema de análisis histórico y generación de combinaciones · {APP_VERSION}"
+        "Análisis histórico y generación de combinaciones · "
+        f"{APP_VERSION}"
     )
 
     st.info(
-        "Este sistema no afirma predecir el resultado de La Tinka. "
-        "Genera combinaciones y permite evaluar históricamente si determinadas "
-        "reglas producen resultados distintos a referencias aleatorias."
+        "La aplicación analiza datos históricos y compara estrategias "
+        "con una referencia aleatoria. Ninguna frecuencia, puntuación "
+        "o combinación garantiza un resultado futuro."
     )
 
     # ----------------------------------------------------------
-    # SIDEBAR: ARCHIVO
+    # ARCHIVO
     # ----------------------------------------------------------
 
     st.sidebar.header("📁 Datos")
 
-    if st.sidebar.button("🔄 Limpiar caché y recargar", use_container_width=True):
+    if st.sidebar.button(
+        "🔄 Limpiar caché y recargar",
+        use_container_width=True,
+    ):
         st.cache_data.clear()
         st.rerun()
 
     uploaded = st.sidebar.file_uploader(
         "Cargar Excel actualizado",
         type=["xlsx", "xlsm"],
-        help="Sube el archivo Excel más reciente. El contenido nuevo se detecta automáticamente.",
     )
 
     if uploaded is not None:
         file_bytes = uploaded.getvalue()
-        file_sig = hashlib.sha256(file_bytes).hexdigest()
         source_name = uploaded.name
-        try:
-            sheets = read_excel_fresh(uploaded)
-        except Exception as exc:
-            st.error(
-                "No se pudo leer el Excel. "
-                f"Detalle técnico: {type(exc).__name__}: {exc}"
-            )
-            st.stop()
     else:
         default_path = find_file()
 
         if default_path is None:
             st.error(
-                "No se encontró el Excel. Sube el archivo actualizado desde la barra lateral."
+                "No se encontró el Excel. Cárgalo desde la barra lateral."
             )
             st.stop()
 
         file_bytes = default_path.read_bytes()
-        file_sig = file_signature(default_path)
         source_name = default_path.name
-        try:
-            sheets = read_excel_fresh(default_path)
-        except Exception as exc:
-            st.error(
-                "No se pudo leer el Excel predeterminado. "
-                f"Detalle técnico: {type(exc).__name__}: {exc}"
-            )
-            st.stop()
+
+    file_signature = hashlib.sha256(file_bytes).hexdigest()
+
+    try:
+        sheets = load_excel_cached(file_bytes)
+    except Exception as exc:
+        st.error(f"No se pudo leer el archivo Excel: {exc}")
+        st.stop()
 
     if "Resultados" not in sheets:
         st.error(
-            "El Excel debe contener una hoja llamada 'Resultados'. "
-            f"Hojas encontradas: {', '.join(sheets.keys())}"
+            "El archivo debe contener una hoja llamada 'Resultados'."
         )
         st.stop()
 
     try:
         df = prepare_results(sheets["Resultados"])
-        df = attach_prize_features(df, file_bytes, file_sig)
+        df = attach_prize_features(df, file_bytes)
 
         schedule = prepare_universe_schedule(sheets)
         df = add_historical_universe(df, schedule)
 
     except Exception as exc:
-        st.error(f"Error al procesar el Excel: {exc}")
+        st.error(f"Error al preparar los datos: {exc}")
+        st.stop()
+
+    if df.empty:
+        st.error("No existen sorteos válidos para analizar.")
         st.stop()
 
     validation = validate_data(df)
-
-    # ----------------------------------------------------------
-    # ESTADO DE ACTUALIZACIÓN
-    # ----------------------------------------------------------
-
-    st.sidebar.divider()
-    st.sidebar.subheader("🔄 Estado de datos")
+    coverage = prize_coverage(df)
 
     latest_date = df["Fecha"].max()
     latest_rows = df[df["Fecha"] == latest_date]
+    latest_draw = latest_rows["Sorteo"].max()
 
-    latest_draw = (
-        latest_rows["Sorteo"].max()
-        if not latest_rows.empty else None
-    )
+    st.sidebar.divider()
+    st.sidebar.subheader("🔄 Estado de los datos")
 
     st.sidebar.success(
-        f"Datos cargados hasta:\n\n**{latest_date.strftime('%d/%m/%Y')}**"
+        f"Actualizado hasta: {latest_date.strftime('%d/%m/%Y')}"
     )
 
-    if latest_draw is not None:
-        st.sidebar.metric("Último sorteo", int(latest_draw))
+    st.sidebar.metric(
+        "Último sorteo",
+        int(latest_draw) if pd.notna(latest_draw) else "-",
+    )
 
     st.sidebar.caption(f"Archivo: {source_name}")
-    st.sidebar.caption(f"Registros: {len(df):,}")
-    cov = prize_coverage(df)
+    st.sidebar.caption(f"Registros válidos: {len(df):,}")
     st.sidebar.caption(
-        f"Reventones confirmados: {cov['reventones_confirmados']} · "
-        f"Premios disponibles: {cov['premios']:,}/{cov['total']:,} "
-        f"({cov['cobertura_premio_pct']:.1f}%)"
+        f"Premios disponibles: {coverage['premios']:,}/"
+        f"{coverage['total']:,} "
+        f"({coverage['cobertura_premio_pct']:.1f}%)"
     )
 
-    # Control de frescura frente al último miércoles/domingo conocido.
-    hoy = datetime.now(ZoneInfo("America/Lima")).date()
-    if latest_date.date() < hoy - timedelta(days=4):
+    today = datetime.now(
+        ZoneInfo("America/Lima")
+    ).date()
+
+    if latest_date.date() < today - timedelta(days=4):
         st.sidebar.warning(
             "El archivo podría estar desactualizado. "
-            "Verifica que hayas subido el Excel más reciente."
+            "Verifica la fecha del último sorteo."
         )
-
-    # ----------------------------------------------------------
-    # MÉTRICAS
-    # ----------------------------------------------------------
 
     c1, c2, c3, c4, c5 = st.columns(5)
 
     c1.metric("Sorteos", f"{len(df):,}")
     c2.metric("Desde", df["Fecha"].min().strftime("%d/%m/%Y"))
-    c3.metric("Hasta", df["Fecha"].max().strftime("%d/%m/%Y"))
-    c4.metric("Último sorteo", int(latest_draw) if latest_draw else "-")
-    c5.metric("Premios con dato", f"{cov['cobertura_premio_pct']:.1f}%")
+    c3.metric("Hasta", latest_date.strftime("%d/%m/%Y"))
+    c4.metric(
+        "Último sorteo",
+        int(latest_draw) if pd.notna(latest_draw) else "-",
+    )
+    c5.metric(
+        "Premios con dato",
+        f"{coverage['cobertura_premio_pct']:.1f}%",
+    )
 
     # ----------------------------------------------------------
-    # MENÚ
+    # MENÚ PRINCIPAL
     # ----------------------------------------------------------
 
     menu = st.sidebar.radio(
@@ -1448,40 +1552,52 @@ def main():
     )
 
     # ==========================================================
-    # INICIO
+    # 1. INICIO
     # ==========================================================
 
     if menu == "Inicio":
         st.header("🏠 Resumen")
 
         st.write(
-            "La aplicación está utilizando el contenido completo del Excel "
-            "subido en esta sesión."
+            "La aplicación está utilizando los resultados válidos "
+            "del Excel cargado en esta sesión."
         )
 
         if df.attrs.get("rows_dropped", 0):
             st.warning(
-                f"Se descartaron {df.attrs['rows_dropped']} filas por "
-                "fecha/bolillas incompletas."
+                f"Se omitieron {df.attrs['rows_dropped']} filas "
+                "sin fecha o sin las seis bolillas principales."
             )
 
         st.subheader("Últimos sorteos")
 
-        cols = ["Fecha", "Sorteo"] + BALL_COLUMNS
-        if "Boliyapa" in df.columns:
-            cols.append("Boliyapa")
-        if "Premio" in df.columns:
-            cols.append("Premio")
-        cols.append("ReventoVerde")
+        display_cols = [
+            "Fecha",
+            "Sorteo",
+            *BALL_COLUMNS,
+        ]
+
+        for col in ["Boliyapa", "Sí o Sí", "Premio", "ReventoVerde"]:
+            if col in df.columns:
+                display_cols.append(col)
 
         st.dataframe(
-            df[cols].sort_values(["Fecha", "Sorteo"], ascending=False).head(10),
+            df[display_cols].sort_values(
+                ["Fecha", "Sorteo"],
+                ascending=False,
+            ).head(10),
             use_container_width=True,
             hide_index=True,
         )
 
         st.subheader("Universo histórico")
-        if not schedule.empty:
+
+        if schedule.empty:
+            st.warning(
+                "No se pudo leer la hoja Modificaciones. "
+                "Se utilizará el universo de respaldo de 53 bolillas."
+            )
+        else:
             st.dataframe(
                 schedule,
                 use_container_width=True,
@@ -1489,53 +1605,79 @@ def main():
             )
 
     # ==========================================================
-    # ESTADÍSTICAS
+    # 2. ESTADÍSTICAS
     # ==========================================================
 
     elif menu == "Estadísticas":
         st.header("📊 Estadísticas")
 
         universe_size = universe_for_date(
-            df["Fecha"].max(), schedule
+            latest_date,
+            schedule,
         )
+
         universe = list(range(1, universe_size + 1))
 
         freq = frequency_table(df, universe)
-        st.dataframe(freq, use_container_width=True, hide_index=True)
 
-        st.subheader("Frecuencia")
-        st.bar_chart(freq.set_index("Bolilla")["Apariciones"])
+        st.subheader("Frecuencia y atraso")
 
-        st.subheader("Estructura histórica")
+        st.dataframe(
+            freq,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.subheader("Frecuencia histórica")
+
+        st.bar_chart(
+            freq.set_index("Bolilla")["Apariciones"]
+        )
+
+        st.subheader("Estructura de los sorteos")
+
         stats = structure_statistics(df, universe_size)
 
-        cols = st.columns(4)
         labels = {
             "odd": "Impares",
             "consecutive": "Pares consecutivos",
             "low": "Números bajos",
-            "sum": "Suma",
+            "sum": "Suma de bolillas",
         }
+
+        cols = st.columns(4)
 
         for col, key in zip(cols, stats):
             mean, std = stats[key]
-            col.metric(labels[key], f"{mean:.2f}", f"DE {std:.2f}")
+            col.metric(
+                labels[key],
+                f"{mean:.2f}",
+                f"DE {std:.2f}",
+            )
+
+        st.caption(
+            "Las frecuencias y atrasos describen el pasado. "
+            "No implican que una bolilla atrasada tenga más "
+            "probabilidad matemática de salir."
+        )
 
     # ==========================================================
-    # GENERADOR
+    # 3. GENERADOR
     # ==========================================================
 
     elif menu == "Generador":
         st.header("🎯 Generador de combinaciones")
 
-        current_universe_size = universe_for_date(
-            df["Fecha"].max(), schedule
+        universe_size = universe_for_date(
+            latest_date,
+            schedule,
         )
-        current_universe = list(range(1, current_universe_size + 1))
+
+        universe = list(range(1, universe_size + 1))
 
         st.write(
-            f"Universo vigente según la hoja **Modificaciones**: "
-            f"**1–{current_universe_size}**."
+            f"Universo vigente según Modificaciones: "
+            f"**1–{universe_size}**."
         )
 
         c1, c2, c3 = st.columns(3)
@@ -1553,14 +1695,33 @@ def main():
             min_value=1,
             max_value=20,
             value=3,
+            step=1,
         )
 
         diversity = c3.checkbox(
-            "Diversificar",
+            "Diversificar combinaciones",
             value=True,
         )
 
-        st.subheader("Filtros")
+        max_overlap = st.number_input(
+            "Máximo de bolillas compartidas entre combinaciones",
+            min_value=0,
+            max_value=5,
+            value=3,
+            help="Por ejemplo, 3 significa que dos tickets no podrán compartir más de tres bolillas.",
+        )
+
+        strategy = st.selectbox(
+            "Estrategia de generación",
+            [
+                "Modelo",
+                "Frecuencia",
+                "Frecuencia + Recencia",
+                "Aleatorio",
+            ],
+        )
+
+        st.subheader("Filtros opcionales")
 
         c1, c2, c3 = st.columns(3)
 
@@ -1569,19 +1730,10 @@ def main():
             "Limitar consecutivos",
             value=False,
         )
-        exclude_hist = c3.checkbox(
+        exclude_historical = c3.checkbox(
             "Excluir combinaciones históricas",
             value=False,
-            help="Por independencia matemática, una combinación ya sorteada sigue siendo posible.",
-        )
-
-        use_reventon_gen = st.checkbox(
-            "Usar contexto histórico de reventones",
-            value=False,
-            help=(
-                "Ajusta ligeramente las frecuencias según si el sorteo anterior "
-                "reventó. Es experimental y descriptivo; no implica causalidad."
-            ),
+            help="Una combinación ya sorteada puede volver a salir; este filtro es solo una preferencia.",
         )
 
         min_sum = None
@@ -1590,82 +1742,112 @@ def main():
 
         if use_sum:
             c1, c2 = st.columns(2)
-            min_sum = c1.number_input("Suma mínima", 0, 600, 90)
-            max_sum = c2.number_input("Suma máxima", 0, 600, 195)
+
+            min_sum = c1.number_input(
+                "Suma mínima",
+                min_value=0,
+                max_value=600,
+                value=90,
+            )
+
+            max_sum = c2.number_input(
+                "Suma máxima",
+                min_value=0,
+                max_value=600,
+                value=195,
+            )
+
+            if min_sum > max_sum:
+                st.error("La suma mínima no puede superar la máxima.")
 
         if use_consecutive:
             max_consecutive = st.number_input(
                 "Máximo de pares consecutivos",
-                0,
-                5,
-                1,
+                min_value=0,
+                max_value=5,
+                value=1,
             )
 
         seed_mode = st.radio(
-            "Semilla",
+            "Semilla aleatoria",
             ["Automática", "Manual"],
             horizontal=True,
         )
 
         if seed_mode == "Manual":
-            seed = int(st.number_input("Seed", value=12345, step=1))
+            seed = int(
+                st.number_input(
+                    "Seed",
+                    value=12345,
+                    step=1,
+                )
+            )
         else:
             target_date, target_day = proximo_sorteo()
+
             seed = stable_seed(
                 "generador",
-                df["Fecha"].max(),
+                latest_date,
                 latest_draw,
                 target_date,
                 target_day,
+                strategy,
             )
 
-        if st.button("🚀 Generar combinaciones", type="primary"):
+        if st.button(
+            "🚀 Generar combinaciones",
+            type="primary",
+        ):
+            if use_sum and min_sum > max_sum:
+                st.stop()
+
             candidates, info = generate_candidates(
                 train=df,
-                universe=current_universe,
+                universe=universe,
                 n_candidates=int(n_candidates),
                 seed=seed,
                 min_sum=min_sum,
                 max_sum=max_sum,
                 max_consecutive=max_consecutive,
-                exclude_historical=exclude_hist,
-                use_reventon_context=use_reventon_gen,
-                current_reventon_context=(
-                    safe_bool(df.iloc[-1]["ReventoVerde"])
-                    if use_reventon_gen
-                    else False
-                ),
+                exclude_historical=exclude_historical,
+                strategy=strategy,
             )
 
             selected = select_top_combinations(
                 candidates,
                 top_n=int(top_n),
                 diversity=diversity,
+                max_overlap=int(max_overlap),
             )
 
             if selected.empty:
                 st.error(
-                    "No se encontraron combinaciones. "
-                    "Reduce las restricciones o aumenta los candidatos."
+                    "No se encontraron combinaciones válidas. "
+                    "Reduce los filtros o aumenta los candidatos."
                 )
             else:
                 st.success(
-                    f"Se generaron {info['generated']:,} candidatos válidos "
-                    f"en {info['attempts']:,} intentos "
-                    f"(aceptación {info['acceptance_rate']*100:.2f}%)."
+                    f"Candidatos válidos: {info['generated']:,}. "
+                    f"Intentos: {info['attempts']:,}. "
+                    f"Tasa de aceptación: "
+                    f"{info['acceptance_rate'] * 100:.2f}%."
                 )
 
                 st.subheader("Combinaciones seleccionadas")
 
-                export_df = candidates_to_dataframe(selected)
-
                 for i, row in selected.iterrows():
                     combo = tuple(row["Combinación"])
+
                     st.markdown(
-                        f"### #{i+1}  "
-                        f"**{' - '.join(f'{n:02d}' for n in combo)}**"
+                        f"### #{i + 1} · "
+                        + " - ".join(f"{n:02d}" for n in combo)
                     )
-                    st.caption(f"Score: {row['Score']:.5f}")
+
+                    st.caption(
+                        f"Puntuación interna: {row['Score']:.5f}"
+                    )
+
+                export_df = candidates_to_dataframe(selected)
 
                 st.dataframe(
                     export_df,
@@ -1675,139 +1857,313 @@ def main():
 
                 st.download_button(
                     "⬇️ Descargar CSV",
-                    export_df.to_csv(index=False).encode("utf-8-sig"),
+                    export_df.to_csv(
+                        index=False
+                    ).encode("utf-8-sig"),
                     file_name="combinaciones_la_tinka.csv",
                     mime="text/csv",
                 )
 
+                st.caption(
+                    "La puntuación sirve para ordenar las combinaciones "
+                    "según las reglas seleccionadas; no es una probabilidad "
+                    "calibrada de ganar."
+                )
+
     # ==========================================================
-    # BACKTESTING
+    # 4. BACKTESTING
     # ==========================================================
 
     elif menu == "Backtesting":
         st.header("🧪 Backtesting")
+
         st.write(
-            "El sistema entrena solo con sorteos anteriores y compara las "
-            "combinaciones obtenidas con el sorteo histórico siguiente."
+            "Cada prueba entrena con sorteos anteriores y evalúa "
+            "las combinaciones frente al siguiente resultado histórico."
         )
 
         mode = st.radio(
-            "Modo de ejecución",
+            "Modo",
             ["⚡ Rápido", "🔬 Completo"],
             horizontal=True,
-            help=(
-                "Rápido reduce el número de evaluaciones para comprobar el modelo. "
-                "Completo evalúa muchos más sorteos y tarda considerablemente más."
-            ),
         )
 
         if mode == "⚡ Rápido":
-            default_step, default_candidates = 10, 300
-            st.info("Modo rápido: una prueba cada 10 sorteos y 300 candidatos por prueba.")
+            default_step = 10
+            default_candidates = 300
+
+            st.info(
+                "Modo rápido: una prueba cada 10 sorteos y "
+                "300 candidatos por estrategia."
+            )
         else:
-            default_step, default_candidates = 1, 1000
-            st.warning("Modo completo: una prueba por sorteo. Puede tardar varios minutos.")
+            default_step = 1
+            default_candidates = 1000
+
+            st.warning(
+                "Modo completo: una prueba por sorteo evaluable. "
+                "Puede tardar varios minutos."
+            )
 
         c1, c2, c3, c4 = st.columns(4)
-        min_train = c1.number_input("Sorteos mínimos de entrenamiento", 50, 2000, 200, 10)
-        step = c2.number_input("Paso entre pruebas", 1, 100, default_step, 1)
-        top_n_bt = c3.number_input("Tickets por prueba", 1, 50, 10, 1)
-        n_candidates_bt = c4.number_input("Candidatos por prueba", 100, 10000, default_candidates, 100)
 
-        st.subheader("Restricciones de la prueba")
-        c1, c2, c3 = st.columns(3)
-        use_sum_bt = c1.checkbox("Usar rango de suma", value=False)
-        use_cons_bt = c2.checkbox("Usar límite consecutivos", value=False)
-        exclude_hist_bt = c3.checkbox("Excluir combinaciones históricas", value=False)
-
-        min_sum_bt = max_sum_bt = max_cons_bt = None
-        if use_sum_bt:
-            c1, c2 = st.columns(2)
-            min_sum_bt = c1.number_input("Suma mínima BT", 0, 600, 90)
-            max_sum_bt = c2.number_input("Suma máxima BT", 0, 600, 195)
-        if use_cons_bt:
-            max_cons_bt = st.number_input("Máximo consecutivos BT", 0, 5, 1)
-
-        use_reventon = st.checkbox(
-            "Usar contexto de reventón anterior",
-            value=True,
-            help="Solo usa información conocida antes del sorteo objetivo. Los datos desconocidos no se convierten en 'no reventó'.",
+        min_train = c1.number_input(
+            "Sorteos mínimos de entrenamiento",
+            min_value=50,
+            max_value=2000,
+            value=200,
+            step=10,
         )
 
-        if st.button("▶️ Ejecutar backtesting", type="primary"):
-            strategies = ["Aleatorio", "Modelo", "Frecuencia", "Frecuencia + Recencia"]
-            test_count = len(range(int(min_train), len(df), max(1, int(step))))
-            total_work = max(1, test_count * len(strategies))
+        step = c2.number_input(
+            "Paso entre pruebas",
+            min_value=1,
+            max_value=100,
+            value=default_step,
+            step=1,
+        )
+
+        top_n_bt = c3.number_input(
+            "Tickets por estrategia",
+            min_value=1,
+            max_value=50,
+            value=10,
+            step=1,
+        )
+
+        n_candidates_bt = c4.number_input(
+            "Candidatos por prueba",
+            min_value=100,
+            max_value=10000,
+            value=default_candidates,
+            step=100,
+        )
+
+        st.subheader("Restricciones")
+
+        c1, c2, c3 = st.columns(3)
+
+        use_sum_bt = c1.checkbox(
+            "Usar rango de suma",
+            value=False,
+        )
+
+        use_cons_bt = c2.checkbox(
+            "Limitar consecutivos",
+            value=False,
+        )
+
+        exclude_hist_bt = c3.checkbox(
+            "Excluir combinaciones históricas",
+            value=False,
+        )
+
+        min_sum_bt = None
+        max_sum_bt = None
+        max_cons_bt = None
+
+        if use_sum_bt:
+            c1, c2 = st.columns(2)
+
+            min_sum_bt = c1.number_input(
+                "Suma mínima BT",
+                min_value=0,
+                max_value=600,
+                value=90,
+            )
+
+            max_sum_bt = c2.number_input(
+                "Suma máxima BT",
+                min_value=0,
+                max_value=600,
+                value=195,
+            )
+
+        if use_cons_bt:
+            max_cons_bt = st.number_input(
+                "Máximo consecutivos BT",
+                min_value=0,
+                max_value=5,
+                value=1,
+            )
+
+        diversity_bt = st.checkbox(
+            "Aplicar diversificación a todas las estrategias",
+            value=True,
+        )
+
+        max_overlap_bt = st.number_input(
+            "Máximo de bolillas compartidas BT",
+            min_value=0,
+            max_value=5,
+            value=3,
+        )
+
+        if st.button(
+            "▶️ Ejecutar backtesting",
+            type="primary",
+        ):
+            if use_sum_bt and min_sum_bt > max_sum_bt:
+                st.error(
+                    "La suma mínima no puede superar la máxima."
+                )
+                st.stop()
+
+            if len(df) <= int(min_train):
+                st.error(
+                    "No hay suficientes sorteos posteriores al "
+                    "entrenamiento mínimo."
+                )
+                st.stop()
+
+            test_count = len(
+                range(
+                    int(min_train),
+                    len(df),
+                    int(step),
+                )
+            )
+
+            total_work = test_count * len(STRATEGIES)
+
             progress = st.progress(0.0)
             status = st.empty()
             all_results = []
 
             def update_progress(done, total, strategy_name):
-                fraction = min(1.0, done / max(1, total))
-                progress.progress(fraction)
-                status.info(
-                    f"Procesando **{strategy_name}** · {done:,}/{total:,} "
-                    f"evaluaciones ({fraction:.1%})"
+                fraction = min(
+                    1.0,
+                    done / max(1, total),
                 )
 
-            for idx, strategy in enumerate(strategies):
+                progress.progress(fraction)
+
+                status.info(
+                    f"Procesando {strategy_name}: "
+                    f"{done:,}/{total:,} evaluaciones "
+                    f"({fraction:.1%})."
+                )
+
+            for index, strategy_name in enumerate(STRATEGIES):
                 result = backtest_strategy(
-                    df=df, schedule=schedule, min_train=int(min_train),
-                    step=int(step), top_n=int(top_n_bt),
-                    n_candidates=int(n_candidates_bt), min_sum=min_sum_bt,
-                    max_sum=max_sum_bt, max_consecutive=max_cons_bt,
-                    strategy=strategy, exclude_historical=exclude_hist_bt,
-                    use_reventon_feature=use_reventon,
+                    df=df,
+                    schedule=schedule,
+                    min_train=int(min_train),
+                    step=int(step),
+                    top_n=int(top_n_bt),
+                    n_candidates=int(n_candidates_bt),
+                    min_sum=min_sum_bt,
+                    max_sum=max_sum_bt,
+                    max_consecutive=max_cons_bt,
+                    strategy=strategy_name,
+                    exclude_historical=exclude_hist_bt,
+                    diversity=diversity_bt,
+                    max_overlap=int(max_overlap_bt),
                     progress_callback=update_progress,
-                    progress_offset=idx * test_count,
+                    progress_offset=index * test_count,
                     progress_total=total_work,
                 )
+
                 all_results.append(result)
 
             progress.progress(1.0)
-            status.success(f"Backtesting terminado: {total_work:,} evaluaciones.")
+            status.success("Backtesting terminado.")
 
-            results = pd.concat(all_results, ignore_index=True) if all_results else pd.DataFrame()
+            results = pd.concat(
+                all_results,
+                ignore_index=True,
+            )
+
             if results.empty:
-                st.warning("No hay suficientes datos para ejecutar el backtesting con estos parámetros.")
+                st.warning("No se obtuvieron resultados.")
             else:
                 summary = summarize_backtest(results)
-                st.subheader("Resumen")
-                st.dataframe(summary, use_container_width=True, hide_index=True)
-                st.subheader("Resultados por sorteo")
+
+                st.subheader("Resumen comparativo")
+
                 st.dataframe(
-                    results.sort_values(["Fecha", "Estrategia"]),
-                    use_container_width=True, hide_index=True,
+                    summary.round(2),
+                    use_container_width=True,
+                    hide_index=True,
                 )
+
+                st.subheader("Promedio máximo de aciertos")
+
+                st.bar_chart(
+                    summary.set_index("Estrategia")[
+                        "Promedio máximo aciertos"
+                    ]
+                )
+
+                st.subheader("Resultados por sorteo")
+
+                st.dataframe(
+                    results.sort_values(
+                        ["Fecha", "Estrategia"]
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
                 st.download_button(
                     "⬇️ Descargar resultados del backtesting",
-                    results.to_csv(index=False).encode("utf-8-sig"),
-                    file_name="backtesting_la_tinka.csv", mime="text/csv",
+                    results.to_csv(
+                        index=False
+                    ).encode("utf-8-sig"),
+                    file_name="backtesting_la_tinka.csv",
+                    mime="text/csv",
                 )
+
                 st.info(
-                    "Las métricas son descriptivas: muestran cómo se comportaron "
-                    "las estrategias en datos históricos y no garantizan resultados futuros."
+                    "Para que la comparación sea interpretable, las "
+                    "estrategias usan el mismo número objetivo de tickets, "
+                    "los mismos filtros y la misma regla de diversificación. "
+                    "Si alguna estrategia no logra producir todos los tickets "
+                    "válidos, la columna Tickets muestra la diferencia."
+                )
+
+                st.warning(
+                    "El rendimiento histórico no demuestra una ventaja "
+                    "predictiva futura. Para evaluar diferencias pequeñas "
+                    "se necesitan muchas pruebas y comparación estadística "
+                    "con referencias aleatorias."
                 )
 
     # ==========================================================
-    # REVENTONES
+    # 5. REVENTONES
     # ==========================================================
 
     elif menu == "Reventones":
         st.header("💰 Reventones y premios")
 
-        green_df = df[df["ReventoVerde"]].copy()
-
-        st.metric(
-            "Sorteos marcados como reventados",
-            len(green_df),
-        )
-
-        if green_df.empty:
+        if "ReventoVerde" not in df.columns:
             st.warning(
-                "No se detectaron resaltados verdes en la columna Premio."
+                "No existe información de resaltado de premios."
             )
         else:
+            green_df = df[
+                df["ReventoVerde"].fillna(False).astype(bool)
+            ].copy()
+
+            c1, c2, c3 = st.columns(3)
+
+            c1.metric(
+                "Reventones confirmados",
+                len(green_df),
+            )
+
+            c2.metric(
+                "Registros con estado conocido",
+                int(df["ReventoVerde"].notna().sum()),
+            )
+
+            c3.metric(
+                "Estado desconocido",
+                int(df["ReventoVerde"].isna().sum()),
+            )
+
+            st.subheader("Sorteos marcados en verde")
+
             show_cols = [
                 "Fecha",
                 "Sorteo",
@@ -1816,73 +2172,150 @@ def main():
                 "DiasDesdeUltimoReventonAntes",
             ]
 
-            st.dataframe(
-                green_df[show_cols].sort_values(
-                    ["Fecha", "Sorteo"], ascending=False
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
+            show_cols = [
+                c for c in show_cols if c in green_df.columns
+            ]
 
-            st.subheader("Intervalos entre reventones")
-
-            dates = green_df["Fecha"].sort_values().tolist()
-            if len(dates) >= 2:
-                intervals = [
-                    (dates[i] - dates[i - 1]).days
-                    for i in range(1, len(dates))
-                ]
-
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Promedio días", f"{np.mean(intervals):.1f}")
-                c2.metric("Mediana días", f"{np.median(intervals):.1f}")
-                c3.metric("Máximo días", f"{max(intervals)}")
-
-                st.bar_chart(pd.Series(intervals, name="Días"))
-
-            st.subheader("Premios")
-            prize = green_df[["Fecha", "Sorteo", "Premio"]].dropna()
-            if not prize.empty:
-                st.line_chart(
-                    prize.sort_values("Fecha").set_index("Fecha")["Premio"]
+            if green_df.empty:
+                st.warning(
+                    "No se detectaron celdas verdes en la columna Premio. "
+                    "Comprueba el formato de relleno del Excel."
+                )
+            else:
+                st.dataframe(
+                    green_df[show_cols].sort_values(
+                        ["Fecha", "Sorteo"],
+                        ascending=False,
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
                 )
 
-            st.info(
-                "El resaltado verde se interpreta como la marca histórica "
-                "de 'reventó'. Para el modelo y el backtesting, esta marca "
-                "solo puede utilizarse como información disponible antes "
-                "del siguiente sorteo."
+                dates = (
+                    green_df["Fecha"]
+                    .sort_values()
+                    .tolist()
+                )
+
+                if len(dates) >= 2:
+                    intervals = [
+                        (dates[i] - dates[i - 1]).days
+                        for i in range(1, len(dates))
+                    ]
+
+                    st.subheader("Intervalos entre reventones")
+
+                    c1, c2, c3 = st.columns(3)
+
+                    c1.metric(
+                        "Promedio de días",
+                        f"{np.mean(intervals):.1f}",
+                    )
+
+                    c2.metric(
+                        "Mediana de días",
+                        f"{np.median(intervals):.1f}",
+                    )
+
+                    c3.metric(
+                        "Máximo de días",
+                        f"{max(intervals)}",
+                    )
+
+                    st.bar_chart(
+                        pd.Series(
+                            intervals,
+                            name="Días entre reventones",
+                        )
+                    )
+
+                prizes = green_df[
+                    ["Fecha", "Sorteo", "Premio"]
+                ].dropna()
+
+                if not prizes.empty:
+                    st.subheader("Premios asociados")
+
+                    st.line_chart(
+                        prizes.sort_values("Fecha").set_index("Fecha")[
+                            "Premio"
+                        ]
+                    )
+
+            st.caption(
+                "El color verde se utiliza como señal de reventón según "
+                "el archivo. La detección depende del formato real de las "
+                "celdas; verifica los registros antes de extraer conclusiones."
             )
 
     # ==========================================================
-    # DIAGNÓSTICO
+    # 6. DIAGNÓSTICO
     # ==========================================================
 
     elif menu == "Diagnóstico":
-        st.header("🔎 Diagnóstico")
+        st.header("🔎 Diagnóstico de datos")
 
         st.write(
-            "Estos controles permiten detectar problemas del archivo antes "
-            "de utilizarlo para generar combinaciones."
+            "Revisa la calidad de los registros antes de generar "
+            "combinaciones o ejecutar backtesting."
         )
 
         c1, c2, c3, c4 = st.columns(4)
 
-        c1.metric("Filas válidas", validation["records"])
-        c2.metric("Duplicados de sorteo", validation["duplicate_draws"])
-        c3.metric("Filas repetidas", validation["exact_duplicates"])
-        c4.metric("Bolillas repetidas en fila", validation["repeated_balls"])
-
-        st.subheader("Rango observado")
-        st.write(
-            f"Bolillas observadas en el histórico: "
-            f"{validation['universe_min']}–{validation['universe_max']}"
+        c1.metric(
+            "Filas válidas",
+            validation["records"],
         )
 
-        st.subheader("Universo vigente por período")
+        c2.metric(
+            "Sorteos duplicados",
+            validation["duplicate_draws"],
+        )
+
+        c3.metric(
+            "Filas exactamente duplicadas",
+            validation["exact_duplicates"],
+        )
+
+        c4.metric(
+            "Bolillas repetidas en fila",
+            validation["repeated_balls"],
+        )
+
+        st.subheader("Fechas y bolillas observadas")
+
+        st.write({
+            "Primera fecha": validation["min_date"],
+            "Última fecha": validation["max_date"],
+            "Bolilla mínima observada": validation["universe_min"],
+            "Bolilla máxima observada": validation["universe_max"],
+            "Combinaciones históricas únicas": validation["unique_combinations"],
+            "Bolillas fuera del universo vigente": validation["out_of_range"],
+        })
+
+        if validation["duplicate_draws"]:
+            st.warning(
+                "Existen números de sorteo repetidos. Comprueba si "
+                "corresponden a registros distintos o duplicados."
+            )
+
+        if validation["repeated_balls"]:
+            st.error(
+                "Hay filas con bolillas repetidas dentro de un mismo sorteo."
+            )
+
+        if validation["out_of_range"]:
+            st.warning(
+                "Hay bolillas que no pertenecen al universo indicado "
+                "por la hoja Modificaciones."
+            )
+
+        st.subheader("Universo vigente")
 
         if schedule.empty:
-            st.warning("No se pudo leer la hoja Modificaciones.")
+            st.warning(
+                "No se pudo procesar la hoja Modificaciones."
+            )
         else:
             st.dataframe(
                 schedule,
@@ -1890,13 +2323,23 @@ def main():
                 hide_index=True,
             )
 
-        st.subheader("Reventones detectados")
-        st.write(
-            f"Se detectaron **{validation['reventones']}** celdas de Premio "
-            "con el resaltado verde."
-        )
+        st.subheader("Cobertura de premios y reventones")
+
+        st.write({
+            "Registros": coverage["total"],
+            "Premios con dato": coverage["premios"],
+            "Cobertura de premios (%)": round(
+                coverage["cobertura_premio_pct"], 2
+            ),
+            "Reventones confirmados": coverage["reventones_confirmados"],
+            "Registros con estado conocido": coverage["reventones_conocidos"],
+            "Cobertura de estado (%)": round(
+                coverage["cobertura_reventon_pct"], 2
+            ),
+        })
 
         st.subheader("Último registro")
+
         st.dataframe(
             df.tail(1),
             use_container_width=True,
@@ -1904,21 +2347,33 @@ def main():
         )
 
     # ==========================================================
-    # DATOS
+    # 7. DATOS
     # ==========================================================
 
     elif menu == "Datos":
-        st.header("🗃️ Datos utilizados por el modelo")
+        st.header("🗃️ Datos utilizados por la aplicación")
 
         st.caption(
-            "Esta tabla muestra los datos ya preparados por la aplicación. "
-            "El campo ReventoVerde proviene del resaltado del Excel."
+            "Se muestran los registros después de preparar las fechas, "
+            "las seis bolillas principales, el universo histórico y las "
+            "variables auxiliares disponibles."
         )
 
         st.dataframe(
             df,
             use_container_width=True,
             hide_index=True,
+        )
+
+        csv_data = df.to_csv(
+            index=False
+        ).encode("utf-8-sig")
+
+        st.download_button(
+            "⬇️ Descargar datos procesados",
+            data=csv_data,
+            file_name="la_tinka_datos_procesados.csv",
+            mime="text/csv",
         )
 
 
